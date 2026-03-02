@@ -719,6 +719,8 @@ def _get_hardware_config(twin_uuid: str) -> dict:
             "camera_id": setup.get("wrist_camera_id", 0),
             "resolution": res,
             "fps": fps,
+            "fourcc": setup.get("wrist_camera_fourcc"),
+            "keyframe_interval": setup.get("wrist_camera_keyframe_interval"),
         }
         if wrist_cam["camera_type"] == "realsense":
             wrist_cam["enable_depth"] = setup.get("wrist_camera_enable_depth", False)
@@ -734,6 +736,8 @@ def _get_hardware_config(twin_uuid: str) -> dict:
                 "camera_id": ac.get("camera_id", i + 1),
                 "resolution": ac.get("resolution", "VGA"),
                 "fps": ac.get("fps", fps),
+                "fourcc": ac.get("fourcc"),
+                "keyframe_interval": ac.get("keyframe_interval"),
             }
             if cam["camera_type"] == "realsense":
                 cam["enable_depth"] = ac.get("enable_depth", False)
@@ -1017,6 +1021,8 @@ def start_remoteoperate(client: Cyberwave, twin_uuid: str) -> None:
                 "camera_type": cam_type,
                 "camera_resolution": res_enum,
                 "fps": cam.get("fps", 30),
+                "fourcc": cam.get("fourcc"),
+                "keyframe_interval": cam.get("keyframe_interval"),
             }
             if cam_type == "realsense":
                 entry["enable_depth"] = cam.get("enable_depth", False)
@@ -1131,6 +1137,8 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
                 "camera_type": cam_type,
                 "camera_resolution": res_enum,
                 "fps": cam.get("fps", 30),
+                "fourcc": cam.get("fourcc"),
+                "keyframe_interval": cam.get("keyframe_interval"),
             }
             if cam_type == "realsense":
                 entry["enable_depth"] = cam.get("enable_depth", False)

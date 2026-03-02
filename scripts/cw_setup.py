@@ -101,14 +101,16 @@ def create_setup_config(
                 res = _parse_resolution(resolution)
             elif isinstance(res, str):
                 res = _parse_resolution(res)
+            cam_type = ac.get("camera_type", "cv2")
             config["additional_cameras"].append({
                 "setup_name": setup_name,
-                "camera_type": ac.get("camera_type", "cv2"),
+                "camera_type": cam_type,
                 "camera_id": ac.get("camera_id", i + 1),
                 "camera_name": cam_name,
                 "twin_uuid": ac.get("twin_uuid"),
                 "fps": camera_fps,
                 "resolution": res,
+                "fourcc": ac.get("fourcc") or ("MJPG" if cam_type.lower() == "cv2" else None),
                 "enable_depth": ac.get("enable_depth", False),
                 "depth_fps": depth_fps,
                 "depth_resolution": (_parse_resolution(depth_resolution) if depth_resolution else None),

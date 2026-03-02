@@ -95,7 +95,7 @@ def teleop_loop(
                 follower.send_action(leader_action)
             except Exception:
                 if status_tracker:
-                    status_tracker.increment_errors()
+                    status_tracker.increment_errors_motor()
 
             update_count, skip_count = process_cyberwave_updates(
                 action=follower_action,
@@ -119,7 +119,7 @@ def teleop_loop(
         pass
     except Exception:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_motor()
         raise
 
     return total_update_count, total_skip_count

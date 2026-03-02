@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 # Throttle: minimum seconds between creating the same alert type
 _TEMP_ALERT_THROTTLE = 10.0  # 10 seconds per joint
 _MQTT_ALERT_THROTTLE = 60.0  # 1 minute
-_ERROR_ALERT_THROTTLE = 60.0  # 1 minute
+_ERROR_ALERT_THROTTLE = 60.0  # 1 minute (calibration, etc.)
+_MOTOR_ALERT_THROTTLE = 10.0  # 10 seconds (fast detection for motor issues)
+_MQTT_ERROR_ALERT_THROTTLE = 60.0  # 1 minute for MQTT error rate
 
 _last_alert_times: Dict[str, float] = {}
 _alert_lock = threading.Lock()
@@ -183,18 +185,61 @@ def create_calibration_needed_alert(
         return False
 
 
-def create_high_error_rate_alert(
+def create_motor_error_alert(
     twin: Twin,
     error_count: int,
     *,
-    threshold: int = 1000,
+    threshold: int = 10,
 ) -> bool:
     """
-    Create an alert when error count exceeds threshold.
+    Create an alert when motor/serial error count exceeds threshold.
+
+    Motor failures need fast detection (low threshold, short throttle).
 
     Args:
         twin: Twin instance with alerts
-        error_count: Current error count from status tracker
+        error_count: Current motor error count from status tracker
+        threshold: Create alert when errors exceed this (default 10)
+
+    Returns:
+        True if alert was created, False if throttled or below threshold
+    """
+    if error_count < threshold:
+        return False
+
+    alert_key = "motor_error_rate"
+    if not _should_create_alert(alert_key, _MOTOR_ALERT_THROTTLE):
+        return False
+
+    try:
+        twin.alerts.create(
+            name="Motor communication errors",
+            description=f"Edge script reported {error_count} motor/serial errors",
+            alert_type="motor_error_rate",
+            severity="warning",
+            source_type="edge",
+        )
+        logger.info(f"Created motor error alert: {error_count} motor errors")
+        return True
+    except Exception as e:
+        _log_alert_failure("motor_error_rate", e)
+        return False
+
+
+def create_mqtt_error_alert(
+    twin: Twin,
+    error_count: int,
+    *,
+    threshold: int = 100,
+) -> bool:
+    """
+    Create an alert when MQTT/queue error count exceeds threshold.
+
+    MQTT errors can tolerate more (100 per 60 sec) before alerting.
+
+    Args:
+        twin: Twin instance with alerts
+        error_count: Current MQTT error count from status tracker
         threshold: Create alert when errors exceed this (default 100)
 
     Returns:
@@ -203,20 +248,20 @@ def create_high_error_rate_alert(
     if error_count < threshold:
         return False
 
-    alert_key = "high_error_rate"
-    if not _should_create_alert(alert_key, _ERROR_ALERT_THROTTLE):
+    alert_key = "mqtt_error_rate"
+    if not _should_create_alert(alert_key, _MQTT_ERROR_ALERT_THROTTLE):
         return False
 
     try:
         twin.alerts.create(
-            name="High error rate",
-            description=f"Edge script reported {error_count} errors",
-            alert_type="high_error_rate",
+            name="MQTT/queue error rate",
+            description=f"Edge script reported {error_count} MQTT/queue errors",
+            alert_type="mqtt_error_rate",
             severity="warning",
             source_type="edge",
         )
-        logger.info(f"Created high error rate alert: {error_count} errors")
+        logger.info(f"Created MQTT error alert: {error_count} MQTT errors")
         return True
     except Exception as e:
-        _log_alert_failure("high_error_rate", e)
+        _log_alert_failure("mqtt_error_rate", e)
         return False

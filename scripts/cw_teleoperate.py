@@ -86,7 +86,7 @@ def teleop_loop(
                     follower.send_action(leader_obs)
                 except Exception:
                     if status_tracker:
-                        status_tracker.increment_errors()
+                        status_tracker.increment_errors_motor()
 
             # Send both leader and follower observations to Cyberwave (when both exist).
             # Each is threshold-filtered against its own previous values.
@@ -131,7 +131,7 @@ def teleop_loop(
         pass
     except Exception:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_motor()
         raise
 
     return total_update_count, total_skip_count
@@ -298,7 +298,7 @@ def teleoperate(
             )
         except Exception:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_mqtt()
 
     # Initialize last observation state per source (track normalized positions for threshold filtering)
     last_observation_leader: Dict[str, float] = {}

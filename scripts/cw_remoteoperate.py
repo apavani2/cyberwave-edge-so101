@@ -208,7 +208,7 @@ def remoteoperate(
             )
         except Exception:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_mqtt()
 
     # Send initial position per joint for real-time display (heartbeat will continue)
     try:
@@ -235,7 +235,7 @@ def remoteoperate(
 
     except Exception:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_mqtt()
 
     # Create queue for actions
     queue_size = 1000  # Reasonable queue size

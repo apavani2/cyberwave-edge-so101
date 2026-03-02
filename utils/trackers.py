@@ -6,8 +6,9 @@ import time
 from typing import Any, Dict, List, Literal, Optional
 
 from utils.cw_alerts import (
-    create_high_error_rate_alert,
+    create_motor_error_alert,
     create_mqtt_disconnected_alert,
+    create_mqtt_error_alert,
     create_temperature_alert,
 )
 from utils.temperature import read_temperatures
@@ -34,7 +35,8 @@ class StatusTracker:
         self.messages_received = 0
         self.messages_processed = 0
         self.messages_filtered = 0
-        self.errors = 0
+        self.errors_motor = 0  # Motor/serial communication failures (alert fast)
+        self.errors_mqtt = 0  # MQTT/queue publish failures (tolerate more)
         self.joint_states: Dict[str, float] = {}
         self.joint_temperatures: Dict[str, float] = {}  # "leader_1", "follower_1" -> temperature
         self.joint_index_to_name: Dict[str, str] = {}
@@ -99,9 +101,25 @@ class StatusTracker:
         with self.lock:
             self.messages_filtered += 1
 
-    def increment_errors(self) -> None:
+    def increment_errors_motor(self) -> None:
+        """Increment motor/serial error count. Alert threshold: 10 (fast detection)."""
         with self.lock:
-            self.errors += 1
+            self.errors_motor += 1
+
+    def increment_errors_mqtt(self) -> None:
+        """Increment MQTT/queue error count. Alert threshold: 100 per 60 sec."""
+        with self.lock:
+            self.errors_mqtt += 1
+
+    def reset_errors_motor(self) -> None:
+        """Reset motor error count after alert (avoid repeated alerts for same burst)."""
+        with self.lock:
+            self.errors_motor = 0
+
+    def reset_errors_mqtt(self) -> None:
+        """Reset MQTT error count after alert."""
+        with self.lock:
+            self.errors_mqtt = 0
 
     def update_joint_states(self, states: Dict[str, float]) -> None:
         """Merge new joint states with existing ones (doesn't replace)."""
@@ -143,7 +161,8 @@ class StatusTracker:
                 "messages_received": self.messages_received,
                 "messages_processed": self.messages_processed,
                 "messages_filtered": self.messages_filtered,
-                "errors": self.errors,
+                "errors_motor": self.errors_motor,
+                "errors_mqtt": self.errors_mqtt,
                 "joint_states": self.joint_states.copy(),
                 "joint_temperatures": self.joint_temperatures.copy(),
                 "robot_uuid": self.robot_uuid,
@@ -168,7 +187,8 @@ def run_status_logging_thread(
     When robot (Twin) is provided, creates Cyberwave alerts for:
     - Motor overheating (>55°C warning, >65°C critical)
     - MQTT disconnected
-    - High error rate (>100 errors)
+    - Motor errors (>=10, fast detection, reset after alert)
+    - MQTT/queue errors (>=100 per 60 sec, reset after alert)
 
     Args:
         status_tracker: StatusTracker instance
@@ -223,10 +243,16 @@ def run_status_logging_thread(
                         )
                 if not status.get("mqtt_connected", True):
                     create_mqtt_disconnected_alert(robot)
-                if status.get("errors", 0) >= 100:
-                    create_high_error_rate_alert(
-                        robot, status["errors"], threshold=100
-                    )
+                if status.get("errors_motor", 0) >= 10:
+                    if create_motor_error_alert(
+                        robot, status["errors_motor"], threshold=10
+                    ):
+                        status_tracker.reset_errors_motor()
+                if status.get("errors_mqtt", 0) >= 100:
+                    if create_mqtt_error_alert(
+                        robot, status["errors_mqtt"], threshold=100
+                    ):
+                        status_tracker.reset_errors_mqtt()
 
             lines = []
             lines.append("=" * 70)
@@ -271,17 +297,19 @@ def run_status_logging_thread(
             lines.append("-" * 70)
 
             # Statistics
+            err_motor = status.get("errors_motor", 0)
+            err_mqtt = status.get("errors_mqtt", 0)
             if mode == "teleoperate":
                 stats = (
                     f"FPS:{status['fps']} Cam:{status['camera_fps']} "
                     f"Prod:{status['messages_produced']} Filt:{status['messages_filtered']} "
-                    f"Err:{status['errors']}"
+                    f"ErrM:{err_motor} ErrQ:{err_mqtt}"
                 )
             else:
                 stats = (
                     f"FPS:{status['fps']} Cam:{status['camera_fps']} "
                     f"Recv:{status['messages_received']} Proc:{status['messages_processed']} "
-                    f"Filt:{status['messages_filtered']} Err:{status['errors']}"
+                    f"Filt:{status['messages_filtered']} ErrM:{err_motor} ErrQ:{err_mqtt}"
                 )
             lines.append(stats.ljust(70))
             lines.append("-" * 70)

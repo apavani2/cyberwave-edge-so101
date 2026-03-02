@@ -203,13 +203,13 @@ def motor_writer_worker(
 
             except Exception:
                 if status_tracker:
-                    status_tracker.increment_errors()
+                    status_tracker.increment_errors_motor()
             finally:
                 action_queue.task_done()
 
         except Exception:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_motor()
 
 
 def create_joint_state_callback(
@@ -296,11 +296,11 @@ def create_joint_state_callback(
                     action_queue.put_nowait(action)
                 except queue.Full:
                     if status_tracker:
-                        status_tracker.increment_errors()
+                        status_tracker.increment_errors_mqtt()
 
         except Exception:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_mqtt()
 
     return callback
 
@@ -338,7 +338,7 @@ def _apply_joint_position(
         action_queue.put_nowait(action)
     except queue.Full:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_mqtt()
 
 
 def process_single_joint_update(
@@ -359,7 +359,7 @@ def process_single_joint_update(
 
     if position_radians is None:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_mqtt()
         return
 
     joint_index = None
@@ -375,20 +375,20 @@ def process_single_joint_update(
                     break
         if joint_index is None:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_mqtt()
             return
 
     joint_name = joint_index_to_name.get(joint_index)
     if joint_name is None:
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_mqtt()
         return
 
     try:
         position_radians = float(position_radians)
     except (ValueError, TypeError):
         if status_tracker:
-            status_tracker.increment_errors()
+            status_tracker.increment_errors_mqtt()
         return
 
     _apply_joint_position(

@@ -89,7 +89,7 @@ def cyberwave_update_worker(
 
                 except Exception:
                     if status_tracker:
-                        status_tracker.increment_errors()
+                        status_tracker.increment_errors_mqtt()
                     action_queue.task_done()
 
             if batch_updates:
@@ -116,11 +116,11 @@ def cyberwave_update_worker(
                         status_tracker.update_joint_states(joint_states)
                 except Exception:
                     if status_tracker:
-                        status_tracker.increment_errors()
+                        status_tracker.increment_errors_mqtt()
 
         except Exception:
             if status_tracker:
-                status_tracker.increment_errors()
+                status_tracker.increment_errors_mqtt()
 
 
 def process_cyberwave_updates(
@@ -193,7 +193,7 @@ def process_cyberwave_updates(
                 update_count += 1
             except queue.Full:
                 if status_tracker:
-                    status_tracker.increment_errors()
+                    status_tracker.increment_errors_mqtt()
                 continue
         else:
             skip_count += 1

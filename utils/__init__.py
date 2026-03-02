@@ -2,7 +2,6 @@
 
 from utils.cw_alerts import (
     create_calibration_needed_alert,
-    create_high_error_rate_alert,
     create_mqtt_disconnected_alert,
     create_temperature_alert,
 )
@@ -15,6 +14,5 @@ __all__ = [
     "read_temperatures",
     "create_temperature_alert",
     "create_mqtt_disconnected_alert",
-    "create_high_error_rate_alert",
     "create_calibration_needed_alert",
 ]

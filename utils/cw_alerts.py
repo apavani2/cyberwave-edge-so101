@@ -222,7 +222,7 @@ def create_camera_default_device_alert(
             name="Cameras using default device assignment",
             description=description,
             alert_type="camera_default_device",
-            severity="info",
+            severity="warning",
             source_type="edge",
         )
         logger.info(

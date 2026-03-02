@@ -241,12 +241,95 @@ def _load_edge_fingerprint() -> str | None:
         return None
 
 
+def _get_discovered_devices_from_edge_config(primary_uuid: str) -> list[dict]:
+    """Fallback: collect discovered_devices from edge_config in twin metadata.
+
+    Used when v4l2 returns empty (e.g. container without /dev/video* access).
+    Merges from primary robot and all workspace twin JSONs.
+    """
+    import json
+
+    seen: set[str | int] = set()
+    result: list[dict] = []
+    fp = _load_edge_fingerprint()
+    if not fp:
+        return []
+
+    def _add_devices(devices: list) -> None:
+        if not isinstance(devices, list):
+            return
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            path = d.get("primary_path") or (d.get("paths") or [None])[0]
+            idx = d.get("index")
+            key = path if path else (f"/dev/video{idx}" if idx is not None else None)
+            if key is None:
+                return
+            if key in seen:
+                return
+            seen.add(key)
+            result.append(d)
+
+    def _from_twin(data: dict) -> None:
+        meta = data.get("metadata") or {}
+        edge_configs = meta.get("edge_configs") or {}
+        if not isinstance(edge_configs, dict):
+            return
+        binding = (
+            edge_configs
+            if edge_configs.get("edge_fingerprint") == fp
+            else edge_configs.get(fp)
+        )
+        if isinstance(binding, dict):
+            camera_config = binding.get("camera_config")
+            if isinstance(camera_config, dict):
+                _add_devices(camera_config.get("discovered_devices") or [])
+
+    robot_path = _get_primary_robot_json_path(primary_uuid)
+    if robot_path.is_file():
+        try:
+            with open(robot_path) as f:
+                _from_twin(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            pass
+    for twin in _load_all_twin_jsons():
+        _from_twin(twin)
+
+    return result
+
+
 def _discover_devices_via_v4l2() -> list[dict]:
     """Discover USB cameras via v4l2-ctl (Linux). Returns list of device dicts."""
     from utils.device_utils import discover_usb_cameras
 
     cameras = discover_usb_cameras()
     return [c.to_dict() for c in cameras]
+
+
+def _merge_discovered_with_edge_config(
+    discovered: list[dict], primary_uuid: str
+) -> tuple[list[dict], int]:
+    """Merge v4l2-discovered devices with edge_config fallback. Returns (merged_list, added_count)."""
+    from_edge = _get_discovered_devices_from_edge_config(primary_uuid)
+    if not from_edge:
+        return discovered, 0
+    seen_paths: set[str | int] = set()
+    for d in discovered:
+        path = d.get("primary_path") or (d.get("paths") or [None])[0]
+        idx = d.get("index")
+        key = path if path else (f"/dev/video{idx}" if idx is not None else None)
+        if key:
+            seen_paths.add(key)
+    merged: list[dict] = list(discovered)
+    for d in from_edge:
+        path = d.get("primary_path") or (d.get("paths") or [None])[0]
+        idx = d.get("index")
+        key = path if path else (f"/dev/video{idx}" if idx is not None else None)
+        if key and key not in seen_paths:
+            seen_paths.add(key)
+            merged.append(d)
+    return merged, len(merged) - len(discovered)
 
 
 def _push_discovered_devices_to_edge_config(
@@ -529,6 +612,13 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     sensors_devices, video_device, or are camera assets).
     """
     discovered = _discover_devices_via_v4l2()
+    discovered, added = _merge_discovered_with_edge_config(discovered, primary_uuid)
+    if added:
+        logger.info(
+            "Merged %d device(s) from edge_config (v4l2 found %d)",
+            added,
+            len(discovered) - added,
+        )
     realsense_devices = _filter_realsense_devices(discovered)
     cv2_devices = _filter_cv2_devices(discovered)
     fingerprint = _load_edge_fingerprint()
@@ -630,7 +720,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 "used_default": used_default,
             })
 
-    # RGB twins (robot sensors + attached without depth) → CV2
+    # RGB twins (robot sensors + attached without depth) → CV2, fallback to RealSense if no CV2
     rgb_twins = robot_cams + [c for c in attached if not c.get("has_depth")]
     for c in rgb_twins:
         dev = c.get("video_device")
@@ -641,6 +731,8 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             _mark_device_used(dev)
         else:
             dev = _assign_from_pool(cv2_devices)
+            if dev is None:
+                dev = _assign_from_pool(realsense_devices)
             used_default = dev is not None
         if dev is not None:
             # Infer type from device: RealSense must use realsense, not cv2
@@ -726,7 +818,9 @@ def _ensure_setup(twin_uuid: str) -> None:
     default_cameras = [c for c in cameras if c.get("used_default")]
 
     # Push discovered devices to edge_config (for frontend device selector)
+    # Use same merged discovery as _discover_cameras_for_so101 (v4l2 + edge_config)
     discovered = _discover_devices_via_v4l2()
+    discovered, _ = _merge_discovered_with_edge_config(discovered, twin_uuid)
     fingerprint = _load_edge_fingerprint()
     if discovered and fingerprint:
         _push_discovered_devices_to_edge_config(twin_uuid, fingerprint, discovered)

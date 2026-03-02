@@ -7,6 +7,7 @@ Runs as a long-running process inside the Docker container.
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -359,35 +360,56 @@ def _get_robot_twin_sensor_cameras(primary_uuid: str) -> list[dict]:
     return result
 
 
+def _device_identifiers(dev: str | int) -> set[str | int]:
+    """Return all identifiers for a device (path and index) for consistent matching."""
+    ids: set[str | int] = set()
+    if isinstance(dev, str) and dev.strip():
+        ids.add(dev.strip())
+        if "/dev/video" in dev:
+            m = re.search(r"/dev/video(\d+)", dev.strip())
+            if m:
+                ids.add(int(m.group(1)))
+    elif isinstance(dev, int):
+        ids.add(dev)
+        ids.add(f"/dev/video{dev}")
+    return ids
+
+
 def _resolve_camera_device_for_twin(
     twin: dict,
     cameras_json: list[dict],
     realsense_devices: list[dict],
 ) -> str | int | None:
-    """Resolve video_device or camera_id for a twin from sensors_devices or cameras.json.
+    """Resolve video_device or camera_id for a twin.
 
-    - If twin has metadata.sensors_devices or metadata.video_device: use the specified device.
-    - Also checks asset.metadata for sensors_devices (edge-core may store it there).
-    - If twin is RealSense/depth and no sensors_devices: auto-bind if single RealSense.
-    - If multiple RealSenses: must have sensors_devices (return None otherwise).
+    Priority (checks both twin.metadata and asset.metadata):
+    1. video_device: direct device path (e.g. "/dev/video6")
+    2. sensors_devices: map of sensor name -> device path (e.g. {"wrist_camera": "/dev/video6"})
+       Uses the first non-empty value; for single-sensor camera twins this is correct.
+    3. RealSense only: auto-bind if exactly one RealSense device (no sensors_devices needed).
+
+    Returns the device path or index for cv2/RealSense to use.
     """
     meta = twin.get("metadata") or {}
     asset = twin.get("asset") or {}
     asset_meta = asset.get("metadata") or {} if isinstance(asset, dict) else {}
 
-    def _get_meta(key: str) -> str | dict:
+    def _get_meta(key: str):
         return meta.get(key) or asset_meta.get(key)
 
+    # 1. Prefer explicit video_device
     video_device = (_get_meta("video_device") or "").strip()
     if video_device:
         return str(video_device)
+
+    # 2. Fall back to sensors_devices (sensor name -> device path)
     sensors_devices = _get_meta("sensors_devices")
     if isinstance(sensors_devices, dict):
-        for _sid, dev in sensors_devices.items():
+        for _sensor_name, dev in sensors_devices.items():
             if dev and str(dev).strip():
                 return str(dev).strip()
 
-    # No sensors_devices: for RealSense/depth, auto-bind if single RealSense
+    # 3. RealSense only: auto-bind if single device (no sensors_devices needed)
     if not _twin_is_realsense(twin) and not _twin_has_depth_sensor(twin):
         return None  # Non-RealSense without sensors_devices: caller will use default
 
@@ -480,13 +502,22 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     def _device_key(d: dict) -> str | int:
         return d.get("primary_path") or d.get("index", "?")
 
+    def _is_device_used(dev: str | int) -> bool:
+        """True if device (path or index) is already assigned."""
+        return bool(_device_identifiers(dev) & used_devices)
+
+    def _mark_device_used(dev: str | int) -> None:
+        used_devices.update(_device_identifiers(dev))
+
     def _assign_from_pool(devices: list[dict]) -> str | int | None:
         """Return device from pool, or None if exhausted."""
         for d in devices:
-            key = _device_key(d)
-            if key is not None and key != "?" and key not in used_devices:
-                used_devices.add(key)
-                return d.get("primary_path") or d.get("index", 0)
+            dev = d.get("primary_path") or d.get("index", 0)
+            if dev is None or dev == "?":
+                continue
+            if not _is_device_used(dev):
+                _mark_device_used(dev)
+                return dev
         return None
 
     def _is_realsense_device(dev: str | int) -> bool:
@@ -501,9 +532,9 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     for c in depth_twins:
         dev = c.get("video_device")
         if dev is not None:
-            if dev in used_devices:
+            if _is_device_used(dev):
                 continue
-            used_devices.add(dev)
+            _mark_device_used(dev)
         else:
             dev = _assign_from_pool(realsense_devices)
         if dev is not None:
@@ -523,9 +554,9 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     for c in rgb_twins:
         dev = c.get("video_device")
         if dev is not None:
-            if dev in used_devices:
+            if _is_device_used(dev):
                 continue
-            used_devices.add(dev)
+            _mark_device_used(dev)
         else:
             dev = _assign_from_pool(cv2_devices)
         if dev is not None:
@@ -544,13 +575,13 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     # 3. Unassigned devices: assign to robot twin as wrist/primary (stream to robot)
     unassigned = [
         d for d in realsense_devices + cv2_devices
-        if _device_key(d) not in used_devices
+        if not _is_device_used(d.get("primary_path") or d.get("index", "?"))
     ]
     for i, d in enumerate(unassigned[: 3 - len(result)]):
         dev = d.get("primary_path") or d.get("index", 0)
-        if dev in used_devices:
+        if _is_device_used(dev):
             continue
-        used_devices.add(dev)
+        _mark_device_used(dev)
         cam_type = "realsense" if d in realsense_devices else "cv2"
         setup_name = "wrist" if i == 0 else ADDITIONAL_SETUP_NAMES[min(i - 1, len(ADDITIONAL_SETUP_NAMES) - 1)]
         result.append({

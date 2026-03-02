@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -30,6 +31,12 @@ _current_follower: Optional[object] = (
     None  # SO101Follower – typed loosely to avoid top-level import
 )
 
+# Calibration subprocess (Popen with stdin=PIPE) for "advance" command injection
+_calibration_proc: Optional[subprocess.Popen] = None
+_calibration_client: Optional[Cyberwave] = None
+_calibration_twin_uuid: Optional[str] = None
+_calibration_alert_uuid: Optional[str] = None
+
 
 def _trigger_alert_and_switch_to_calibration(
     client: Cyberwave,
@@ -40,117 +47,43 @@ def _trigger_alert_and_switch_to_calibration(
     leader_id: str = "leader1",
 ) -> None:
     """
-    We ended up here because:
-    - The user tried to start local teleop or remote teleop AND
-    - No calibration file was found
-    So what happens is:
-    - We should trigger an alert (check the alert example in the SDK)
-    - We should switch to calibration mode
-
-    Then once the calibration is done: We should resolve the alert and switch back to the original mode.
+    User tried to start teleop/remoteoperate but calibration is missing.
+    Create an alert with calibration args in metadata. The user can then
+    trigger calibration via the frontend (backend dispatches commands to
+    twin/command). For offline use, run: python -m scripts.cw_calibrate directly.
     """
+    robot = client.twin(twin_id=twin_uuid)
 
-    # Create a robot twin to access the alerts API
-    robot = client.twin(
-        twin_id=twin_uuid,
+    metadata = {
+        "calibration": {
+            "follower_port": follower_port,
+            "follower_id": follower_id,
+        }
+    }
+    if leader_port is not None:
+        metadata["calibration"]["leader_port"] = leader_port
+        metadata["calibration"]["leader_id"] = leader_id
+
+    description = "No calibration file found. Use the frontend to start calibration, or run: python -m scripts.cw_calibrate --type follower --port {port} --id {id}".format(
+        port=follower_port,
+        id=follower_id,
     )
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        description = (
+            "Calibration requires interactive mode. "
+            "SSH into the device and run: python -m scripts.cw_calibrate "
+            f"--type follower --port {follower_port} --id {follower_id}"
+        )
 
-    # Trigger an alert to notify the user that calibration is needed
     alert = robot.alerts.create(
         name="Calibration Needed",
-        description="No calibration file found for the follower arm. Switching to calibration mode.",
+        description=description,
         severity="warning",
         alert_type="calibration_needed",
+        metadata=metadata,
     )
     logger.info("Created calibration alert %s for twin %s", alert.uuid, twin_uuid)
-
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        logger.warning(
-            "Non-interactive mode: calibration requires TTY. "
-            "Run: docker exec -it <container> python -m scripts.cw_calibrate "
-            "--type follower --port %s --id %s",
-            follower_port,
-            follower_id,
-        )
-        alert.update(
-            severity="warning",
-            description=(
-                "Calibration requires interactive mode. "
-                "SSH into the device and run: python -m scripts.cw_calibrate "
-                f"--type follower --port {follower_port} --id {follower_id}"
-            ),
-        )
-        client.mqtt.publish_command_message(twin_uuid, "error")
-        return
-
-    try:
-        import subprocess
-
-        calibrate_cmd = [
-            sys.executable,
-            "-m",
-            "scripts.cw_calibrate",
-            "--type",
-            "follower",
-            "--port",
-            follower_port,
-            "--id",
-            follower_id,
-        ]
-        logger.info("Starting calibration subprocess: %s", " ".join(calibrate_cmd))
-
-        result = subprocess.run(calibrate_cmd)
-
-        if result.returncode != 0:
-            logger.error("Calibration subprocess exited with code %s", result.returncode)
-            alert.update(
-                severity="error",
-                description="Automatic calibration failed. Please calibrate manually.",
-            )
-            client.mqtt.publish_command_message(twin_uuid, "error")
-            return
-
-        logger.info("Calibration completed for follower %s", follower_id)
-
-        # If there is also a leader, calibrate it too
-        if leader_port is not None:
-            leader_cmd = [
-                sys.executable,
-                "-m",
-                "scripts.cw_calibrate",
-                "--type",
-                "leader",
-                "--port",
-                leader_port,
-                "--id",
-                leader_id,
-            ]
-            logger.info("Starting leader calibration subprocess: %s", " ".join(leader_cmd))
-
-            result = subprocess.run(leader_cmd)
-
-            if result.returncode != 0:
-                logger.error("Leader calibration subprocess exited with code %s", result.returncode)
-                alert.update(
-                    severity="error",
-                    description="Leader calibration failed. Please calibrate manually.",
-                )
-                client.mqtt.publish_command_message(twin_uuid, "error")
-                return
-
-            logger.info("Calibration completed for leader %s", leader_id)
-
-        # Resolve the alert now that calibration is done
-        alert.resolve()
-        logger.info("Calibration alert %s resolved", alert.uuid)
-
-    except Exception:
-        logger.exception("Calibration failed for follower %s", follower_id)
-        alert.update(
-            severity="error",
-            description="Automatic calibration failed. Please calibrate manually.",
-        )
-        client.mqtt.publish_command_message(twin_uuid, "error")
+    client.mqtt.publish_command_message(twin_uuid, "error")
 
 
 def _is_follower_calibrated(follower_id: str = "follower1") -> bool:
@@ -808,6 +741,134 @@ SUPPORTED_COMMANDS = frozenset({
 })
 
 
+def _handle_calibration_advance(client: Cyberwave, twin_uuid: str) -> None:
+    """Send Enter to the running calibration subprocess (simulates user pressing Enter)."""
+    global _calibration_proc
+    if _calibration_proc is None or _calibration_proc.stdin is None:
+        logger.warning("No calibration subprocess running; cannot advance")
+        client.mqtt.publish_command_message(twin_uuid, "error")
+        return
+    try:
+        _calibration_proc.stdin.write(b"\n")
+        _calibration_proc.stdin.flush()
+        logger.info("Sent advance (Enter) to calibration subprocess")
+        client.mqtt.publish_command_message(twin_uuid, "ok")
+    except Exception:
+        logger.exception("Failed to send advance to calibration subprocess")
+        client.mqtt.publish_command_message(twin_uuid, "error")
+
+
+def _handle_calibration_cancel(client: Cyberwave, twin_uuid: str) -> None:
+    """Terminate the running calibration subprocess."""
+    global _calibration_proc
+    if _calibration_proc is None:
+        logger.warning("No calibration subprocess running; cannot cancel")
+        client.mqtt.publish_command_message(twin_uuid, "ok")
+        return
+    try:
+        _calibration_proc.terminate()
+        _calibration_proc.wait(timeout=5)
+    except Exception:
+        try:
+            _calibration_proc.kill()
+        except Exception:
+            pass
+    finally:
+        _calibration_proc = None
+    logger.info("Calibration subprocess cancelled")
+    client.mqtt.publish_command_message(twin_uuid, "ok")
+
+
+def _run_calibration_with_advance(
+    client: Cyberwave,
+    twin_uuid: str,
+    device_type: str,
+    port: str,
+    device_id: str,
+    alert_uuid: Optional[str] = None,
+) -> None:
+    """Run calibration subprocess with stdin=PIPE so MQTT 'advance' commands can inject Enter."""
+    global _calibration_proc, _calibration_client, _calibration_twin_uuid, _calibration_alert_uuid
+
+    _calibration_client = client
+    _calibration_twin_uuid = twin_uuid
+    _calibration_alert_uuid = alert_uuid
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.cw_calibrate",
+        "--type",
+        device_type,
+        "--port",
+        port,
+        "--id",
+        device_id,
+    ]
+    logger.info("Starting calibration subprocess (stdin=PIPE): %s", " ".join(cmd))
+
+    try:
+        _calibration_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        result = _calibration_proc.wait()
+    except Exception:
+        logger.exception("Calibration subprocess failed")
+        result = -1
+    finally:
+        _calibration_proc = None
+
+    if result == 0:
+        client.mqtt.publish_command_message(twin_uuid, "ok")
+        if alert_uuid:
+            try:
+                robot = client.twin(twin_id=twin_uuid)
+                alert = robot.alerts.get(alert_uuid)
+                alert.resolve()
+                logger.info("Calibration alert %s resolved", alert_uuid)
+            except Exception:
+                logger.exception("Failed to resolve calibration alert")
+    else:
+        client.mqtt.publish_command_message(twin_uuid, "error")
+
+
+def _handle_calibration_start(
+    client: Cyberwave,
+    twin_uuid: str,
+    data: dict,
+) -> None:
+    """Start calibration subprocess in background with stdin=PIPE for advance commands."""
+    device_type = data.get("type") or "follower"
+    port = (
+        data.get("follower_port")
+        or data.get("leader_port")
+        or data.get("port")
+        or (os.getenv("CYBERWAVE_METADATA_FOLLOWER_PORT") if device_type == "follower" else os.getenv("CYBERWAVE_METADATA_LEADER_PORT"))
+    )
+    device_id = data.get("follower_id") or data.get("leader_id") or data.get("id") or (device_type + "1")
+
+    if not port:
+        logger.error("No port for calibration (type=%s)", device_type)
+        client.mqtt.publish_command_message(twin_uuid, "error")
+        return
+
+    alert_uuid = data.get("alert_uuid")
+
+    thread = threading.Thread(
+        target=_run_calibration_with_advance,
+        args=(client, twin_uuid, device_type, port, device_id),
+        kwargs={"alert_uuid": alert_uuid},
+        daemon=True,
+        name="calibration",
+    )
+    thread.start()
+    logger.info("Calibration thread started for %s on %s", device_type, port)
+    client.mqtt.publish_command_message(twin_uuid, "ok")
+
+
 def _run_script_command(
     client: Cyberwave,
     twin_uuid: str,
@@ -819,8 +880,6 @@ def _run_script_command(
 
     extra_cli: raw CLI args from payload.args when it's a list (e.g. ["--find-port"]).
     """
-    import subprocess
-
     module_map = {
         "find_port": "scripts.cw_find_port",
         "read_device": "scripts.cw_read_device",
@@ -930,6 +989,19 @@ def handle_command(client: Cyberwave, twin_uuid: str, command: str, payload: dic
     raw_args = payload.get("args")
     script_args = {**data, **raw_args} if isinstance(raw_args, dict) else data
     extra_cli = raw_args if isinstance(raw_args, list) else []
+
+    # Calibrate with step: frontend-driven flow (advance = inject Enter to subprocess)
+    if cmd == "calibrate":
+        step = script_args.get("step")
+        if step == "advance":
+            _handle_calibration_advance(client, twin_uuid)
+            return
+        if step == "cancel":
+            _handle_calibration_cancel(client, twin_uuid)
+            return
+        if step == "start_calibration":
+            _handle_calibration_start(client, twin_uuid, script_args)
+            return
 
     match cmd:
         case "stop":

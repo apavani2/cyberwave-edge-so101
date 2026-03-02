@@ -438,13 +438,24 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     used_devices: set[str | int] = set()
     result: list[dict] = []
 
+    def _device_key(d: dict) -> str | int:
+        return d.get("primary_path") or d.get("index", "?")
+
     def _assign_from_pool(devices: list[dict]) -> str | int | None:
+        """Return device from pool, or None if exhausted."""
         for d in devices:
-            key = d.get("primary_path") or d.get("index")
-            if key is not None and key not in used_devices:
+            key = _device_key(d)
+            if key is not None and key != "?" and key not in used_devices:
                 used_devices.add(key)
                 return d.get("primary_path") or d.get("index", 0)
         return None
+
+    def _is_realsense_device(dev: str | int) -> bool:
+        """True if device matches a RealSense in cameras.json."""
+        for d in realsense_devices:
+            if d.get("primary_path") == dev or d.get("index") == dev:
+                return True
+        return False
 
     # Depth twins first → RealSense
     depth_twins = [c for c in attached if c.get("has_depth")]
@@ -457,11 +468,12 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
         else:
             dev = _assign_from_pool(realsense_devices)
         if dev is not None:
+            cam_type = "realsense" if _is_realsense_device(dev) else "cv2"
             result.append({
                 "twin_uuid": c.get("twin_uuid"),
                 "attach_to_link": c.get("attach_to_link", ""),
                 "setup_name": c.get("setup_name", "primary"),
-                "camera_type": "realsense",
+                "camera_type": cam_type,
                 "camera_id": dev,
                 "video_device": dev,
                 "enable_depth": True,
@@ -478,15 +490,39 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
         else:
             dev = _assign_from_pool(cv2_devices)
         if dev is not None:
+            # Infer type from device: RealSense must use realsense, not cv2
+            cam_type = "realsense" if _is_realsense_device(dev) else "cv2"
             result.append({
                 "twin_uuid": c.get("twin_uuid"),
                 "attach_to_link": c.get("attach_to_link", ""),
                 "setup_name": c.get("setup_name", "primary"),
-                "camera_type": "cv2",
+                "camera_type": cam_type,
                 "camera_id": dev,
                 "video_device": dev,
                 "enable_depth": False,
             })
+
+    # 3. Unassigned devices: assign to robot twin as wrist/primary (stream to robot)
+    unassigned = [
+        d for d in realsense_devices + cv2_devices
+        if _device_key(d) not in used_devices
+    ]
+    for i, d in enumerate(unassigned[: 3 - len(result)]):
+        dev = d.get("primary_path") or d.get("index", 0)
+        if dev in used_devices:
+            continue
+        used_devices.add(dev)
+        cam_type = "realsense" if d in realsense_devices else "cv2"
+        setup_name = "wrist" if i == 0 else ("primary" if i == 1 else "secondary")
+        result.append({
+            "twin_uuid": primary_uuid,
+            "attach_to_link": "robot_sensor",
+            "setup_name": setup_name,
+            "camera_type": cam_type,
+            "camera_id": dev,
+            "video_device": dev,
+            "enable_depth": cam_type == "realsense",
+        })
 
     # Sort: wrist first, then primary, then secondary
     def _order(c: dict) -> int:

@@ -312,6 +312,11 @@ def _get_robot_twin_sensor_cameras(primary_uuid: str) -> list[dict]:
     if isinstance(asset, dict):
         metadata = asset.get("metadata") or metadata
 
+    # sensors_devices can be in metadata or at root (edge sync / manual edit)
+    sensors_devices = metadata.get("sensors_devices") or data.get("sensors_devices") or {}
+    if isinstance(asset, dict) and not sensors_devices:
+        sensors_devices = asset.get("metadata", {}).get("sensors_devices") or {}
+
     sensor_ids: list[str] = []
     schema = metadata.get("universal_schema") or asset.get("universal_schema")
     if schema and isinstance(schema, dict):
@@ -338,9 +343,8 @@ def _get_robot_twin_sensor_cameras(primary_uuid: str) -> list[dict]:
                     sid = s.get("id") or s.get("name") or f"sensor_{i}"
                     sensor_ids.append(str(sid))
 
-    sensors_devices = metadata.get("sensors_devices") or {}
     if not isinstance(sensors_devices, dict):
-        return []
+        sensors_devices = {}
 
     # Use sensor_ids from schema if found; else use sensors_devices keys (e.g. "Logitech C920 camera")
     ids_to_check = sensor_ids if sensor_ids else list(sensors_devices.keys())
@@ -397,13 +401,15 @@ def _resolve_camera_device_for_twin(
     def _get_meta(key: str):
         return meta.get(key) or asset_meta.get(key)
 
-    # 1. Prefer explicit video_device
-    video_device = (_get_meta("video_device") or "").strip()
+    # 1. Prefer explicit video_device (metadata, asset.metadata, or root)
+    video_device = (
+        _get_meta("video_device") or twin.get("video_device") or ""
+    ).strip()
     if video_device:
         return str(video_device)
 
-    # 2. Fall back to sensors_devices (sensor name -> device path)
-    sensors_devices = _get_meta("sensors_devices")
+    # 2. Fall back to sensors_devices (metadata, asset.metadata, or root)
+    sensors_devices = _get_meta("sensors_devices") or twin.get("sensors_devices")
     if isinstance(sensors_devices, dict):
         for _sensor_name, dev in sensors_devices.items():
             if dev and str(dev).strip():
@@ -432,6 +438,8 @@ def _twin_is_camera_like(twin: dict) -> bool:
     if meta.get("video_device") or meta.get("sensors_devices"):
         return True
     if asset_meta.get("video_device") or asset_meta.get("sensors_devices"):
+        return True
+    if twin.get("video_device") or twin.get("sensors_devices"):
         return True
     if _twin_is_realsense(twin) or _twin_has_depth_sensor(twin):
         return True

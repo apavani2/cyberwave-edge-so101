@@ -223,50 +223,71 @@ RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera"})
 DEPTH_SENSOR_TYPES = frozenset({"depth", "rgbd"})
 
 
-def _get_discovered_devices_from_twins(primary_uuid: str) -> list[dict]:
-    """Collect discovered_devices from twin metadata (from cyberwave edge sync-devices).
-
-    Merges metadata.discovered_devices from the primary robot and all workspace twin JSONs.
-    Deduplicates by primary_path. Returns empty list if no twins have discovered_devices.
-    """
+def _load_edge_fingerprint() -> str | None:
+    """Load edge fingerprint from fingerprint.json (written by edge-core)."""
     import json
 
-    seen: set[str | int] = set()
-    result: list[dict] = []
+    from utils.config import get_so101_lib_dir
 
-    def _add_devices(devices: list) -> None:
-        if not isinstance(devices, list):
-            return
-        for d in devices:
-            if not isinstance(d, dict):
-                continue
-            path = d.get("primary_path") or (d.get("paths") or [None])[0]
-            idx = d.get("index")
-            key = path if path else (f"/dev/video{idx}" if idx is not None else None)
-            if key is None:
-                key = str(id(d))
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(d)
+    fingerprint_file = get_so101_lib_dir().parent / "fingerprint.json"
+    if not fingerprint_file.is_file():
+        return None
+    try:
+        with open(fingerprint_file) as f:
+            data = json.load(f)
+        fp = data.get("fingerprint")
+        return str(fp).strip() if fp else None
+    except (json.JSONDecodeError, OSError):
+        return None
 
-    # Primary robot twin (may be at custom path)
-    robot_path = _get_primary_robot_json_path(primary_uuid)
-    if robot_path.is_file():
-        try:
+
+def _discover_devices_via_v4l2() -> list[dict]:
+    """Discover USB cameras via v4l2-ctl (Linux). Returns list of device dicts."""
+    from utils.device_utils import discover_usb_cameras
+
+    cameras = discover_usb_cameras()
+    return [c.to_dict() for c in cameras]
+
+
+def _push_discovered_devices_to_edge_config(
+    twin_uuid: str,
+    fingerprint: str,
+    devices_list: list[dict],
+) -> None:
+    """Push discovered_devices to the twin's edge_config via pair_device (merge with existing)."""
+    if not devices_list:
+        return
+    token = os.getenv("CYBERWAVE_API_KEY")
+    if not token:
+        return
+    try:
+        import json
+
+        # Get existing camera_config from twin JSON (edge-core sync)
+        existing_camera_config: dict = {}
+        robot_path = _get_primary_robot_json_path(twin_uuid)
+        if robot_path.is_file():
             with open(robot_path) as f:
                 data = json.load(f)
-            meta = (data.get("metadata") or data.get("asset", {}).get("metadata") or {})
-            _add_devices(meta.get("discovered_devices") or [])
-        except (json.JSONDecodeError, OSError):
-            pass
+            metadata = (data.get("metadata") or {})
+            edge_configs = metadata.get("edge_configs") or {}
+            if isinstance(edge_configs, dict):
+                binding = None
+                if edge_configs.get("edge_fingerprint") == fingerprint:
+                    binding = edge_configs
+                elif isinstance(edge_configs.get(fingerprint), dict):
+                    binding = edge_configs[fingerprint]
+                if isinstance(binding, dict):
+                    existing_camera_config = binding.get("camera_config") or {}
+                    if not isinstance(existing_camera_config, dict):
+                        existing_camera_config = {}
 
-    # All workspace twins
-    for twin in _load_all_twin_jsons():
-        meta = twin.get("metadata") or {}
-        _add_devices(meta.get("discovered_devices") or [])
-
-    return result
+        merged = {**existing_camera_config, "discovered_devices": devices_list}
+        client = Cyberwave(token=token, source_type="edge")
+        client.twins.pair_device(twin_uuid, fingerprint, edge_config=merged)
+        logger.info("Pushed discovered_devices (%d) to edge_config for twin %s", len(devices_list), twin_uuid)
+    except Exception as e:
+        logger.warning("Could not push discovered_devices to edge_config: %s", e)
 
 
 def _twin_has_depth_sensor(twin: dict) -> bool:
@@ -488,7 +509,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     Includes both attached twins and workspace twins that are camera-like (have
     sensors_devices, video_device, or are camera assets).
     """
-    discovered = _get_discovered_devices_from_twins(primary_uuid)
+    discovered = _discover_devices_via_v4l2()
     realsense_devices = _filter_realsense_devices(discovered)
     cv2_devices = _filter_cv2_devices(discovered)
 
@@ -683,6 +704,13 @@ def _ensure_setup(twin_uuid: str) -> None:
 
     cameras = _discover_cameras_for_so101(twin_uuid)
     default_cameras = [c for c in cameras if c.get("used_default")]
+
+    # Push discovered devices to edge_config (for frontend device selector)
+    discovered = _discover_devices_via_v4l2()
+    fingerprint = _load_edge_fingerprint()
+    if discovered and fingerprint:
+        _push_discovered_devices_to_edge_config(twin_uuid, fingerprint, discovered)
+
     if default_cameras:
         token = os.getenv("CYBERWAVE_API_KEY")
         if token:

@@ -419,6 +419,9 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
         if str(attach) != str(primary_uuid):
             continue
         has_depth = _twin_has_depth_sensor(t)
+        is_realsense = _twin_is_realsense(t)
+        # RealSense assets are treated as depth cameras even without explicit depth sensor type
+        is_depth_camera = has_depth or is_realsense
         meta = t.get("metadata") or {}
         setup_name = (meta.get("setup_name") or "").strip().lower()
         attach_link = (t.get("attach_to_link") or "").lower()
@@ -430,7 +433,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             "twin_uuid": t.get("uuid"),
             "attach_to_link": t.get("attach_to_link", ""),
             "setup_name": setup_name,
-            "has_depth": has_depth,
+            "has_depth": is_depth_camera,
             "video_device": video_device,
         })
 

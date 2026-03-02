@@ -275,6 +275,15 @@ def _get_realsense_devices_from_cameras_json(devices: list[dict]) -> list[dict]:
     ]
 
 
+def _get_cv2_devices_from_cameras_json(devices: list[dict]) -> list[dict]:
+    """Filter cameras.json devices to non-RealSense (CV2/USB webcams)."""
+    return [
+        d
+        for d in devices
+        if "realsense" not in (d.get("card") or "").lower() and "intel" not in (d.get("card") or "").lower()
+    ]
+
+
 def _get_robot_twin_sensor_cameras(primary_uuid: str) -> list[dict]:
     """Get camera entries from the primary robot twin's RGB sensors (sensors_devices).
 
@@ -385,36 +394,31 @@ def _resolve_camera_device_for_twin(
 def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     """Find cameras for SO101: primary robot sensors + attached camera twins.
 
-    Supports 3 cameras with semantic roles: primary, secondary, wrist_cam.
-    Uses cameras.json (from CLI sync-devices) + twin JSONs for device binding.
+    Assigns devices from cameras.json to twins by sensor type:
+    - Depth sensor twin → RealSense device
+    - RGB sensor twin → CV2 device
 
-    - Twins with depth sensors or RealSense asset → RealSense with enable_depth.
-    - If twin has sensors_devices → use that device.
-    - If single RealSense and twin needs it → auto-bind.
-    - metadata.setup_name: "primary", "secondary", "wrist" for semantic role.
+    Each twin gets exactly one device; each device is used at most once.
+    Supports max 3 cameras with semantic roles: primary, secondary, wrist_cam.
     """
     cameras_json = _load_cameras_json()
     realsense_devices = _get_realsense_devices_from_cameras_json(cameras_json)
+    cv2_devices = _get_cv2_devices_from_cameras_json(cameras_json)
 
-    # 1. Primary robot's own sensors (wrist) from primary JSON
+    # 1. Collect all camera twins (robot sensors + attached)
     robot_cams = _get_robot_twin_sensor_cameras(primary_uuid)
     for rc in robot_cams:
         rc["setup_name"] = "wrist"
         rc["enable_depth"] = False
+        rc["has_depth"] = False
 
-    # 2. Attached camera twins (attach_to_twin_uuid == primary_robot_uuid)
     twins = _load_all_twin_jsons()
     attached: list[dict] = []
     for t in twins:
         attach = t.get("attach_to_twin_uuid") or t.get("attach_to_twin")
         if str(attach) != str(primary_uuid):
             continue
-        asset = t.get("asset") or {}
         has_depth = _twin_has_depth_sensor(t)
-        is_realsense = _twin_is_realsense(t) or has_depth
-        cam_type = "realsense" if is_realsense else "cv2"
-        enable_depth = has_depth  # Depth sensor twin → RealSense with depth enabled
-
         meta = t.get("metadata") or {}
         setup_name = (meta.get("setup_name") or "").strip().lower()
         attach_link = (t.get("attach_to_link") or "").lower()
@@ -422,19 +426,67 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             setup_name = "wrist" if "wrist" in attach_link or "robot_sensor" in attach_link else "primary"
 
         video_device = _resolve_camera_device_for_twin(t, cameras_json, realsense_devices)
-        if video_device is None and cam_type == "realsense" and len(realsense_devices) > 1:
-            continue  # Skip: multiple RealSenses, need sensors_devices
-
-        camera_id = video_device if video_device is not None else (0 if "wrist" in (t.get("attach_to_link") or "").lower() else 1)
         attached.append({
             "twin_uuid": t.get("uuid"),
             "attach_to_link": t.get("attach_to_link", ""),
             "setup_name": setup_name,
-            "camera_type": cam_type,
-            "camera_id": camera_id,
+            "has_depth": has_depth,
             "video_device": video_device,
-            "enable_depth": enable_depth,
         })
+
+    # 2. Assign devices: depth twins → RealSense, RGB twins → CV2 (one-to-one)
+    used_devices: set[str | int] = set()
+    result: list[dict] = []
+
+    def _assign_from_pool(devices: list[dict]) -> str | int | None:
+        for d in devices:
+            key = d.get("primary_path") or d.get("index")
+            if key is not None and key not in used_devices:
+                used_devices.add(key)
+                return d.get("primary_path") or d.get("index", 0)
+        return None
+
+    # Depth twins first → RealSense
+    depth_twins = [c for c in attached if c.get("has_depth")]
+    for c in depth_twins:
+        dev = c.get("video_device")
+        if dev is not None:
+            if dev in used_devices:
+                continue
+            used_devices.add(dev)
+        else:
+            dev = _assign_from_pool(realsense_devices)
+        if dev is not None:
+            result.append({
+                "twin_uuid": c.get("twin_uuid"),
+                "attach_to_link": c.get("attach_to_link", ""),
+                "setup_name": c.get("setup_name", "primary"),
+                "camera_type": "realsense",
+                "camera_id": dev,
+                "video_device": dev,
+                "enable_depth": True,
+            })
+
+    # RGB twins (robot sensors + attached without depth) → CV2
+    rgb_twins = robot_cams + [c for c in attached if not c.get("has_depth")]
+    for c in rgb_twins:
+        dev = c.get("video_device")
+        if dev is not None:
+            if dev in used_devices:
+                continue
+            used_devices.add(dev)
+        else:
+            dev = _assign_from_pool(cv2_devices)
+        if dev is not None:
+            result.append({
+                "twin_uuid": c.get("twin_uuid"),
+                "attach_to_link": c.get("attach_to_link", ""),
+                "setup_name": c.get("setup_name", "primary"),
+                "camera_type": "cv2",
+                "camera_id": dev,
+                "video_device": dev,
+                "enable_depth": False,
+            })
 
     # Sort: wrist first, then primary, then secondary
     def _order(c: dict) -> int:
@@ -445,11 +497,10 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             return 1
         if sn == "secondary":
             return 2
-        return 1 if "wrist" in (c.get("attach_to_link") or "").lower() else 2
+        return 1
 
-    attached.sort(key=lambda c: (_order(c), c.get("twin_uuid", "")))
-    combined = robot_cams + attached
-    return combined[:3]
+    result.sort(key=lambda c: (_order(c), c.get("twin_uuid", "")))
+    return result[:3]
 
 
 def _ensure_setup(twin_uuid: str) -> None:
@@ -482,13 +533,21 @@ def _ensure_setup(twin_uuid: str) -> None:
         existing["follower_port"] = discovered["follower_port"]
 
     cameras = _discover_cameras_for_so101(twin_uuid)
-    # Partition by setup_name: wrist, primary, secondary
+    # Partition by setup_name: wrist, primary, secondary (no fallback - each twin appears once)
     def _by_setup(c, name):
         return (c.get("setup_name") or "").lower() == name
-    wrist_cam = next((c for c in cameras if _by_setup(c, "wrist") or "wrist" in (c.get("attach_to_link") or "").lower()), cameras[0] if cameras else None)
+    wrist_cam = next(
+        (c for c in cameras if _by_setup(c, "wrist") or "wrist" in (c.get("attach_to_link") or "").lower()),
+        None,
+    )
     primary_cam = next((c for c in cameras if _by_setup(c, "primary")), None)
     secondary_cam = next((c for c in cameras if _by_setup(c, "secondary")), None)
-    add_cams = [c for c in [primary_cam, secondary_cam] if c is not None]
+    # Exclude wrist from additional - each twin must appear only once
+    add_cams = [
+        c
+        for c in [primary_cam, secondary_cam]
+        if c is not None and (wrist_cam is None or c.get("twin_uuid") != wrist_cam.get("twin_uuid"))
+    ]
 
     def _camera_id(cam: dict | None) -> int | str:
         if not cam:

@@ -612,6 +612,11 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     sensors_devices, video_device, or are camera assets).
     """
     discovered = _discover_devices_via_v4l2()
+    logger.info(
+        "Camera discovery: v4l2 found %d device(s) %s",
+        len(discovered),
+        [(d.get("card"), d.get("primary_path") or d.get("index")) for d in discovered],
+    )
     discovered, added = _merge_discovered_with_edge_config(discovered, primary_uuid)
     if added:
         logger.info(
@@ -621,6 +626,13 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
         )
     realsense_devices = _filter_realsense_devices(discovered)
     cv2_devices = _filter_cv2_devices(discovered)
+    logger.info(
+        "Device pools: realsense=%d %s, cv2=%d %s",
+        len(realsense_devices),
+        [(d.get("card"), d.get("primary_path") or d.get("index")) for d in realsense_devices],
+        len(cv2_devices),
+        [(d.get("card"), d.get("primary_path") or d.get("index")) for d in cv2_devices],
+    )
     fingerprint = _load_edge_fingerprint()
 
     # 1. Collect all camera twins (robot sensors + attached + workspace camera twins)
@@ -662,6 +674,22 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             "has_depth": is_depth_camera,
             "video_device": video_device,
         })
+
+    logger.info(
+        "Camera twins: robot_cams=%d, attached=%d (depth=%d, rgb=%d)",
+        len(robot_cams),
+        len(attached),
+        sum(1 for c in attached if c.get("has_depth")),
+        sum(1 for c in attached if not c.get("has_depth")),
+    )
+    for c in attached:
+        logger.info(
+            "  twin %s setup=%s has_depth=%s video_device=%s",
+            c.get("twin_uuid"),
+            c.get("setup_name"),
+            c.get("has_depth"),
+            c.get("video_device"),
+        )
 
     # 2. Assign devices: depth twins → RealSense, RGB twins → CV2 (one-to-one)
     used_devices: set[str | int] = set()
@@ -720,6 +748,8 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 "used_default": used_default,
             })
 
+    logger.info("After depth assignment: %d camera(s) in result", len(result))
+
     # RGB twins (robot sensors + attached without depth) → CV2, fallback to RealSense if no CV2
     rgb_twins = robot_cams + [c for c in attached if not c.get("has_depth")]
     for c in rgb_twins:
@@ -748,11 +778,20 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 "used_default": used_default,
             })
 
+    logger.info("After RGB assignment: %d camera(s) in result", len(result))
+
     # 3. Unassigned devices: assign to robot twin as wrist/primary (stream to robot)
     unassigned = [
         d for d in realsense_devices + cv2_devices
         if not _is_device_used(d.get("primary_path") or d.get("index", "?"))
     ]
+    logger.info(
+        "Unassigned devices: %d available %s, adding up to %d (slots left=%d)",
+        len(unassigned),
+        [(x.get("card"), x.get("primary_path") or x.get("index")) for x in unassigned],
+        min(len(unassigned), 3 - len(result)),
+        3 - len(result),
+    )
     for i, d in enumerate(unassigned[: 3 - len(result)]):
         dev = d.get("primary_path") or d.get("index", 0)
         if _is_device_used(dev):
@@ -782,7 +821,13 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             return 1
 
     result.sort(key=lambda c: (_order(c), c.get("twin_uuid", "")))
-    return result[:MAX_CAMERAS]
+    result = result[:MAX_CAMERAS]
+    logger.info(
+        "Camera setup result: %d camera(s) %s",
+        len(result),
+        [(c.get("setup_name"), c.get("camera_type"), c.get("video_device"), c.get("twin_uuid")) for c in result],
+    )
+    return result
 
 
 def _ensure_setup(twin_uuid: str) -> None:
@@ -792,6 +837,7 @@ def _ensure_setup(twin_uuid: str) -> None:
     /dev/tty.usbmodem* on macOS), runs voltage detection, and assigns leader (lower voltage)
     and follower (higher voltage). Updates setup.json with discovered ports.
     """
+    logger.info("Running setup for twin %s", twin_uuid)
     from utils.utils import ensure_video_device_permissions
 
     ensure_video_device_permissions()
@@ -852,6 +898,12 @@ def _ensure_setup(twin_uuid: str) -> None:
         if not _by_setup(c, "wrist") and "wrist" not in (c.get("attach_to_link") or "").lower()
         and (wrist_cam is None or c.get("twin_uuid") != wrist_cam.get("twin_uuid"))
     ]
+    logger.info(
+        "Setup partition: wrist=%s, additional=%d cameras %s",
+        bool(wrist_cam),
+        len(add_cams),
+        [(c.get("setup_name"), c.get("camera_type"), c.get("video_device")) for c in add_cams],
+    )
 
     def _camera_id(cam: dict | None) -> int | str:
         if not cam:

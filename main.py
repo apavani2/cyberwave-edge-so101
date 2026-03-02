@@ -223,20 +223,50 @@ RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera"})
 DEPTH_SENSOR_TYPES = frozenset({"depth", "rgbd"})
 
 
-def _load_cameras_json() -> list[dict]:
-    """Load cameras from cameras.json (written by cyberwave edge sync-devices / camera-discovery)."""
+def _get_discovered_devices_from_twins(primary_uuid: str) -> list[dict]:
+    """Collect discovered_devices from twin metadata (from cyberwave edge sync-devices).
+
+    Merges metadata.discovered_devices from the primary robot and all workspace twin JSONs.
+    Deduplicates by primary_path. Returns empty list if no twins have discovered_devices.
+    """
     import json
 
-    config_dir = _get_config_dir()
-    cameras_file = config_dir / "cameras.json"
-    if not cameras_file.exists():
-        return []
-    try:
-        with open(cameras_file) as f:
-            data = json.load(f)
-        return data.get("devices", [])
-    except (json.JSONDecodeError, OSError):
-        return []
+    seen: set[str | int] = set()
+    result: list[dict] = []
+
+    def _add_devices(devices: list) -> None:
+        if not isinstance(devices, list):
+            return
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            path = d.get("primary_path") or (d.get("paths") or [None])[0]
+            idx = d.get("index")
+            key = path if path else (f"/dev/video{idx}" if idx is not None else None)
+            if key is None:
+                key = str(id(d))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(d)
+
+    # Primary robot twin (may be at custom path)
+    robot_path = _get_primary_robot_json_path(primary_uuid)
+    if robot_path.is_file():
+        try:
+            with open(robot_path) as f:
+                data = json.load(f)
+            meta = (data.get("metadata") or data.get("asset", {}).get("metadata") or {})
+            _add_devices(meta.get("discovered_devices") or [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # All workspace twins
+    for twin in _load_all_twin_jsons():
+        meta = twin.get("metadata") or {}
+        _add_devices(meta.get("discovered_devices") or [])
+
+    return result
 
 
 def _twin_has_depth_sensor(twin: dict) -> bool:
@@ -267,8 +297,8 @@ def _twin_is_realsense(twin: dict) -> bool:
     return "realsense" in reg or "realsense" in name or "intel" in name
 
 
-def _get_realsense_devices_from_cameras_json(devices: list[dict]) -> list[dict]:
-    """Filter cameras.json devices to RealSense only (card contains Intel/RealSense)."""
+def _filter_realsense_devices(devices: list[dict]) -> list[dict]:
+    """Filter to RealSense only (card contains Intel/RealSense)."""
     return [
         d
         for d in devices
@@ -276,8 +306,8 @@ def _get_realsense_devices_from_cameras_json(devices: list[dict]) -> list[dict]:
     ]
 
 
-def _get_cv2_devices_from_cameras_json(devices: list[dict]) -> list[dict]:
-    """Filter cameras.json devices to non-RealSense (CV2/USB webcams)."""
+def _filter_cv2_devices(devices: list[dict]) -> list[dict]:
+    """Filter to non-RealSense (CV2/USB webcams)."""
     return [
         d
         for d in devices
@@ -381,7 +411,6 @@ def _device_identifiers(dev: str | int) -> set[str | int]:
 
 def _resolve_camera_device_for_twin(
     twin: dict,
-    cameras_json: list[dict],
     realsense_devices: list[dict],
 ) -> str | int | None:
     """Resolve video_device or camera_id for a twin.
@@ -450,7 +479,7 @@ def _twin_is_camera_like(twin: dict) -> bool:
 def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     """Find cameras for SO101: primary robot sensors + attached/workspace camera twins.
 
-    Assigns devices from cameras.json to twins by sensor type:
+    Assigns devices from twin metadata discovered_devices to twins by sensor type:
     - Depth sensor twin → RealSense device
     - RGB sensor twin → CV2 device
 
@@ -459,9 +488,9 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     Includes both attached twins and workspace twins that are camera-like (have
     sensors_devices, video_device, or are camera assets).
     """
-    cameras_json = _load_cameras_json()
-    realsense_devices = _get_realsense_devices_from_cameras_json(cameras_json)
-    cv2_devices = _get_cv2_devices_from_cameras_json(cameras_json)
+    discovered = _get_discovered_devices_from_twins(primary_uuid)
+    realsense_devices = _filter_realsense_devices(discovered)
+    cv2_devices = _filter_cv2_devices(discovered)
 
     # 1. Collect all camera twins (robot sensors + attached + workspace camera twins)
     robot_cams = _get_robot_twin_sensor_cameras(primary_uuid)
@@ -494,7 +523,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 setup_name = ADDITIONAL_SETUP_NAMES[min(additional_idx, len(ADDITIONAL_SETUP_NAMES) - 1)]
                 additional_idx += 1
 
-        video_device = _resolve_camera_device_for_twin(t, cameras_json, realsense_devices)
+        video_device = _resolve_camera_device_for_twin(t, realsense_devices)
         attached.append({
             "twin_uuid": t_uuid,
             "attach_to_link": t.get("attach_to_link", ""),
@@ -529,7 +558,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
         return None
 
     def _is_realsense_device(dev: str | int) -> bool:
-        """True if device matches a RealSense in cameras.json."""
+        """True if device matches a RealSense in discovered devices."""
         for d in realsense_devices:
             if d.get("primary_path") == dev or d.get("index") == dev:
                 return True
@@ -539,12 +568,14 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
     depth_twins = [c for c in attached if c.get("has_depth")]
     for c in depth_twins:
         dev = c.get("video_device")
+        used_default = False
         if dev is not None:
             if _is_device_used(dev):
                 continue
             _mark_device_used(dev)
         else:
             dev = _assign_from_pool(realsense_devices)
+            used_default = dev is not None
         if dev is not None:
             cam_type = "realsense" if _is_realsense_device(dev) else "cv2"
             result.append({
@@ -555,18 +586,21 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 "camera_id": dev,
                 "video_device": dev,
                 "enable_depth": True,
+                "used_default": used_default,
             })
 
     # RGB twins (robot sensors + attached without depth) → CV2
     rgb_twins = robot_cams + [c for c in attached if not c.get("has_depth")]
     for c in rgb_twins:
         dev = c.get("video_device")
+        used_default = False
         if dev is not None:
             if _is_device_used(dev):
                 continue
             _mark_device_used(dev)
         else:
             dev = _assign_from_pool(cv2_devices)
+            used_default = dev is not None
         if dev is not None:
             # Infer type from device: RealSense must use realsense, not cv2
             cam_type = "realsense" if _is_realsense_device(dev) else "cv2"
@@ -578,6 +612,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
                 "camera_id": dev,
                 "video_device": dev,
                 "enable_depth": False,
+                "used_default": used_default,
             })
 
     # 3. Unassigned devices: assign to robot twin as wrist/primary (stream to robot)
@@ -600,6 +635,7 @@ def _discover_cameras_for_so101(primary_uuid: str) -> list[dict]:
             "camera_id": dev,
             "video_device": dev,
             "enable_depth": cam_type == "realsense",
+            "used_default": True,  # No sensors_devices configured; assigned from pool
         })
 
     # Sort: wrist first, then primary, secondary, tertiary, etc.
@@ -646,6 +682,19 @@ def _ensure_setup(twin_uuid: str) -> None:
         existing["follower_port"] = discovered["follower_port"]
 
     cameras = _discover_cameras_for_so101(twin_uuid)
+    default_cameras = [c for c in cameras if c.get("used_default")]
+    if default_cameras:
+        token = os.getenv("CYBERWAVE_API_KEY")
+        if token:
+            try:
+                client = Cyberwave(token=token, source_type="edge")
+                robot = client.twin(twin_id=twin_uuid)
+                from utils.cw_alerts import create_camera_default_device_alert
+
+                create_camera_default_device_alert(robot, default_cameras)
+            except Exception as e:
+                logger.warning("Could not create camera default device alert: %s", e)
+
     # Partition: wrist vs additional (primary, secondary, tertiary, etc.)
     def _by_setup(c, name):
         return (c.get("setup_name") or "").lower() == name

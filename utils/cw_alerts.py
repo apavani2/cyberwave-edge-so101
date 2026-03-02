@@ -4,7 +4,7 @@ import logging
 import sys
 import threading
 import time
-from typing import Dict
+from typing import Dict, List
 
 from cyberwave import Twin
 
@@ -182,6 +182,56 @@ def create_calibration_needed_alert(
         return True
     except Exception as e:
         _log_alert_failure("calibration_needed", e)
+        return False
+
+
+def create_camera_default_device_alert(
+    twin: Twin,
+    default_cameras: List[dict],
+) -> bool:
+    """
+    Create an info alert when cameras use default device assignment (no sensors_devices).
+
+    Args:
+        twin: Twin instance with alerts (typically the robot twin)
+        default_cameras: List of camera dicts with used_default=True, each containing
+            setup_name, twin_uuid, video_device (or camera_id)
+
+    Returns:
+        True if alert was created, False if empty list
+    """
+    if not default_cameras:
+        return False
+
+    parts = []
+    for c in default_cameras:
+        setup_name = c.get("setup_name", "camera")
+        dev = c.get("video_device") or c.get("camera_id", "?")
+        if str(dev).startswith("/dev/"):
+            parts.append(f"{setup_name}={dev}")
+        else:
+            parts.append(f"{setup_name}=/dev/video{dev}")
+    description = (
+        "Cameras using default device assignment (no sensors_devices or video_device in metadata): "
+        + ", ".join(parts)
+        + ". Configure sensors_devices in Sensor Settings for stable mapping."
+    )
+
+    try:
+        twin.alerts.create(
+            name="Cameras using default device assignment",
+            description=description,
+            alert_type="camera_default_device",
+            severity="info",
+            source_type="edge",
+        )
+        logger.info(
+            "Created camera default device alert: %d camera(s) using pool assignment",
+            len(default_cameras),
+        )
+        return True
+    except Exception as e:
+        _log_alert_failure("camera_default_device", e)
         return False
 
 

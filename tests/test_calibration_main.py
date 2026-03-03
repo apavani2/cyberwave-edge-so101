@@ -197,3 +197,135 @@ class TestHandleCommandCalibrate:
         mock_start.assert_called_once_with(
             mock_client, "twin-uuid-456", valid_calibration_data
         )
+
+
+class TestStopCurrentOperationGracefulShutdown:
+    """Tests for _stop_current_operation graceful shutdown behavior."""
+
+    def test_sets_stop_event_before_force_disconnect(self):
+        """_stop_current_operation sets stop_event first, then waits before force disconnect."""
+        import main as main_module
+
+        stop_event = __import__("threading").Event()
+        mock_follower = MagicMock()
+        mock_thread = MagicMock()
+        mock_thread.is_alive.side_effect = [True, True, False]
+
+        with patch.object(main_module, "_current_thread", mock_thread):
+            with patch.object(main_module, "_current_follower", mock_follower):
+                with patch.object(main_module, "_operation_stop_event", stop_event):
+                    with patch.object(main_module, "_calibration_proc", None):
+                        main_module._stop_current_operation()
+
+        assert stop_event.is_set()
+        mock_thread.join.assert_called()
+        calls = mock_thread.join.call_args_list
+        assert len(calls) >= 1
+        assert calls[0][1]["timeout"] == main_module.GRACEFUL_JOIN_TIMEOUT
+
+    def test_does_not_force_disconnect_when_thread_exits_gracefully(self):
+        """When thread exits after stop_event, no force disconnect is needed."""
+        import main as main_module
+
+        stop_event = __import__("threading").Event()
+        mock_follower = MagicMock()
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = False
+
+        with patch.object(main_module, "_current_thread", mock_thread):
+            with patch.object(main_module, "_current_follower", mock_follower):
+                with patch.object(main_module, "_operation_stop_event", stop_event):
+                    with patch.object(main_module, "_calibration_proc", None):
+                        main_module._stop_current_operation()
+
+        mock_follower.disconnect.assert_not_called()
+
+    def test_force_disconnects_when_thread_does_not_exit_gracefully(self):
+        """When thread does not exit within graceful timeout, force disconnect is called."""
+        import main as main_module
+
+        stop_event = __import__("threading").Event()
+        mock_follower = MagicMock()
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = True  # Thread never exits
+
+        with patch.object(main_module, "_current_thread", mock_thread):
+            with patch.object(main_module, "_current_follower", mock_follower):
+                with patch.object(main_module, "_operation_stop_event", stop_event):
+                    with patch.object(main_module, "_calibration_proc", None):
+                        main_module._stop_current_operation()
+
+        mock_follower.disconnect.assert_called_once()
+
+    def test_stops_calibration_subprocess_gracefully(self):
+        """_stop_current_operation terminates calibration first, then kill if needed."""
+        import main as main_module
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = False
+
+        with patch.object(main_module, "_current_thread", mock_thread):
+            with patch.object(main_module, "_current_follower", None):
+                with patch.object(main_module, "_operation_stop_event", None):
+                    with patch.object(main_module, "_calibration_proc", mock_proc):
+                        main_module._stop_current_operation()
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.wait.assert_called_once_with(timeout=5)
+        mock_proc.kill.assert_not_called()
+
+
+class TestSingleScriptAtATime:
+    """Tests for single-script-at-a-time concurrency guards."""
+
+    def test_run_script_command_calls_stop_before_running(self):
+        """_run_script_command calls _stop_current_operation before running script."""
+        import main as main_module
+
+        mock_client = MagicMock()
+        mock_client.mqtt.publish_command_message = MagicMock()
+
+        with patch.object(main_module, "_stop_current_operation", MagicMock()) as mock_stop:
+            with patch.object(main_module, "subprocess") as mock_subprocess:
+                mock_subprocess.run.return_value = MagicMock(returncode=0)
+
+                main_module._run_script_command(
+                    mock_client,
+                    twin_uuid="twin-123",
+                    script_name="find_port",
+                    data={},
+                )
+
+        mock_stop.assert_called_once()
+
+    def test_handle_calibration_start_calls_stop_when_not_rejecting(self):
+        """_handle_calibration_start calls _stop_current_operation before starting."""
+        import main as main_module
+
+        valid_data = {
+            "type": "follower",
+            "follower_port": "/dev/ttyACM0",
+            "follower_id": "follower1",
+        }
+
+        with patch.object(main_module, "_calibration_proc", None):
+            with patch.object(main_module, "_stop_current_operation", MagicMock()) as mock_stop:
+                with patch.object(main_module, "threading") as mock_threading:
+                    mock_threading.Thread.return_value = MagicMock()
+                    mock_client = MagicMock()
+                    mock_client.mqtt.publish_command_message = MagicMock()
+                    mock_robot = MagicMock()
+                    mock_alert = MagicMock()
+                    mock_alert.metadata = {}
+                    mock_robot.alerts.get.return_value = mock_alert
+                    mock_client.twin.return_value = mock_robot
+
+                    main_module._handle_calibration_start(
+                        mock_client,
+                        "twin-123",
+                        valid_data,
+                    )
+
+        mock_stop.assert_called_once()

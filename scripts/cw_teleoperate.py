@@ -144,6 +144,7 @@ def teleoperate(
     robot: Twin,
     cameras: Optional[List[Dict[str, Any]]] = None,
     position_threshold: float = 0.1,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     """
     Run teleoperation loop: read from leader, send to follower, and send follower data to Cyberwave.
@@ -167,6 +168,8 @@ def teleoperate(
             (camera_id, camera_type, camera_resolution, fps, enable_depth, etc.).
             CameraStreamManager uses these directly.
         position_threshold: Minimum change in position to trigger an update (in normalized units)
+        stop_event: Optional event to signal loop exit. When provided by main.py (edge-core),
+            setting it stops the loop. When None (standalone script), creates one internally.
     """
     time_reference = TimeReference()
 
@@ -313,9 +316,10 @@ def teleoperate(
     seconds = 60  # seconds
     queue_size = num_joints * sampling_rate * seconds
     action_queue = queue.Queue(maxsize=queue_size)  # Limit queue size to prevent memory issues
-    stop_event = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
 
-    # Start keyboard input thread for 'q' key to stop gracefully
+    # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
     keyboard_thread = threading.Thread(
         target=keyboard_input_thread,
         args=(stop_event,),

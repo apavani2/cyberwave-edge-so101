@@ -30,6 +30,9 @@ _current_thread: Optional[threading.Thread] = None
 _current_follower: Optional[object] = (
     None  # SO101Follower – typed loosely to avoid top-level import
 )
+# Stop event passed to remoteoperate/teleoperate so _stop_current_operation can
+# signal them to exit (used when run by edge-core in Docker, no terminal).
+_operation_stop_event: Optional[threading.Event] = None
 
 # Calibration subprocess (Popen with stdin=PIPE) for "advance" command injection
 _calibration_proc: Optional[subprocess.Popen] = None
@@ -41,6 +44,10 @@ _calibration_alert_uuid: Optional[str] = None
 # stored; calibrate is never stored to avoid infinite loops.
 RECOVERY_COMMANDS = frozenset({"teleoperate", "remoteoperate"})
 _pending_recovery_command: Optional[str] = None
+
+# Graceful shutdown: give scripts time to stop MQTT, send end messages, cleanup.
+GRACEFUL_JOIN_TIMEOUT = 30.0  # seconds to wait for thread to exit and cleanup
+FORCE_DISCONNECT_JOIN_TIMEOUT = 5.0  # seconds after force disconnect if graceful fails
 
 
 def _trigger_alert_and_switch_to_calibration(
@@ -1009,25 +1016,51 @@ def _get_hardware_config(twin_uuid: str) -> dict:
 
 
 def _stop_current_operation() -> None:
-    """Stop any currently running operation and disconnect the follower."""
-    global _current_thread, _current_follower
+    """Stop any currently running operation (teleoperate, remoteoperate, or calibration).
 
+    Stops gracefully: signals the script to exit first, giving it time to stop MQTT,
+    send end messages, and cleanup. Only force-disconnects if the thread does not
+    exit within the graceful timeout.
+    """
+    global _current_thread, _current_follower, _operation_stop_event, _calibration_proc
+
+    # Stop teleoperate/remoteoperate gracefully
     if _current_thread is not None and _current_thread.is_alive():
-        logger.info("Stopping current operation …")
-        # The remoteoperate loop checks a threading.Event internally; disconnecting
-        # the follower and interrupting the thread is the pragmatic way to stop it
-        # from outside without modifying the remoteoperate module.
-        if _current_follower is not None:
-            try:
-                _current_follower.disconnect()  # type: ignore[union-attr]
-            except Exception:
-                logger.exception("Error disconnecting follower")
-        _current_thread.join(timeout=10.0)
+        logger.info("Stopping current operation (graceful shutdown) …")
+        # 1. Signal scripts to exit (they will cleanup MQTT, cameras, etc.)
+        if _operation_stop_event is not None:
+            _operation_stop_event.set()
+        # 2. Wait for thread to exit and cleanup
+        _current_thread.join(timeout=GRACEFUL_JOIN_TIMEOUT)
+        # 3. If still alive, force disconnect and wait again
         if _current_thread.is_alive():
-            logger.warning("Operation thread did not stop in time")
+            logger.warning("Operation did not stop in time; force disconnecting follower")
+            if _current_follower is not None:
+                try:
+                    _current_follower.disconnect()  # type: ignore[union-attr]
+                except Exception:
+                    logger.exception("Error disconnecting follower")
+            _current_thread.join(timeout=FORCE_DISCONNECT_JOIN_TIMEOUT)
+            if _current_thread.is_alive():
+                logger.warning("Operation thread did not stop after force disconnect")
 
     _current_thread = None
     _current_follower = None
+    _operation_stop_event = None
+
+    # Stop calibration subprocess gracefully (SIGTERM first, then SIGKILL)
+    if _calibration_proc is not None:
+        logger.info("Stopping calibration subprocess (graceful shutdown) …")
+        try:
+            _calibration_proc.terminate()
+            _calibration_proc.wait(timeout=5)
+        except Exception:
+            try:
+                _calibration_proc.kill()
+            except Exception:
+                pass
+        finally:
+            _calibration_proc = None
 
 
 # Commands that map to so101-* scripts (pyproject.toml [project.scripts])
@@ -1167,7 +1200,7 @@ def _handle_calibration_start(
     """Start calibration subprocess in background with stdin=PIPE for advance commands."""
     global _calibration_proc
 
-    # Reject concurrent calibration
+    # Reject concurrent calibration (check before _stop_current_operation, which clears _calibration_proc)
     if _calibration_proc is not None and _calibration_proc.poll() is None:
         logger.warning("Calibration already running; rejecting start_calibration")
         client.mqtt.publish_command_message(
@@ -1175,6 +1208,9 @@ def _handle_calibration_start(
             {"status": "error", "reason": "calibration_already_running"},
         )
         return
+
+    # Only one script at a time: stop teleoperate/remoteoperate before starting calibration
+    _stop_current_operation()
 
     device_type = data.get("type") or "follower"
     port = (
@@ -1229,8 +1265,10 @@ def _run_script_command(
 ) -> None:
     """Run a one-off script (calibrate, find_port, read_device, setup, write_position) as subprocess.
 
+    Stops any running teleoperate/remoteoperate/calibration first (only one script at a time).
     extra_cli: raw CLI args from payload.args when it's a list (e.g. ["--find-port"]).
     """
+    _stop_current_operation()
     module_map = {
         "find_port": "scripts.cw_find_port",
         "read_device": "scripts.cw_read_device",
@@ -1386,7 +1424,7 @@ def start_remoteoperate(client: Cyberwave, twin_uuid: str) -> None:
     ``CYBERWAVE_METADATA_*`` env vars, creates the follower + twins, and
     launches the ``remoteoperate`` loop from :pymod:`scripts.cw_remoteoperate`.
     """
-    global _current_thread, _current_follower
+    global _current_thread, _current_follower, _operation_stop_event
 
     logger.info("Starting remoteoperate")
 
@@ -1407,6 +1445,9 @@ def start_remoteoperate(client: Cyberwave, twin_uuid: str) -> None:
             recovery_command="remoteoperate",
         )
         return
+
+    operation_stop_event = threading.Event()
+    _operation_stop_event = operation_stop_event
 
     def _run() -> None:
         global _current_follower
@@ -1475,6 +1516,7 @@ def start_remoteoperate(client: Cyberwave, twin_uuid: str) -> None:
                 follower=follower,
                 robot=robot,
                 cameras=cameras_list if cameras_list else None,
+                stop_event=operation_stop_event,
             )
         except Exception:
             logger.exception("Remoteoperate loop failed")
@@ -1497,7 +1539,7 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
     ``CYBERWAVE_METADATA_*`` env vars, creates the leader + follower + twins,
     and launches the ``teleoperate`` loop from :pymod:`scripts.cw_teleoperate`.
     """
-    global _current_thread, _current_follower
+    global _current_thread, _current_follower, _operation_stop_event
 
     logger.info("Starting teleoperate")
 
@@ -1533,6 +1575,9 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
             device_type="leader",
         )
         return
+
+    operation_stop_event = threading.Event()
+    _operation_stop_event = operation_stop_event
 
     def _run() -> None:
         global _current_follower
@@ -1608,6 +1653,7 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
                 follower=follower,
                 robot=robot,
                 cameras=cameras_list if cameras_list else None,
+                stop_event=operation_stop_event,
             )
         except Exception:
             logger.exception("Teleoperate loop failed")

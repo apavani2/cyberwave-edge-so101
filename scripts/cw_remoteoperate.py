@@ -51,6 +51,7 @@ def remoteoperate(
     follower: SO101Follower,
     robot: Optional[Twin] = None,
     cameras: Optional[List[Dict[str, Any]]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     """
     Run remote operation loop: receive joint states via MQTT and write to follower motors.
@@ -65,6 +66,8 @@ def remoteoperate(
         cameras: List of camera configs from setup.json. Each dict has twin + overrides
             (camera_id, camera_type, camera_resolution, fps, enable_depth, etc.).
             CameraStreamManager uses these directly.
+        stop_event: Optional event to signal loop exit. When provided by main.py (edge-core),
+            setting it stops the loop. When None (standalone script), creates one internally.
     """
     time_reference = TimeReference()
 
@@ -240,9 +243,10 @@ def remoteoperate(
     # Create queue for actions
     queue_size = 1000  # Reasonable queue size
     action_queue = queue.Queue(maxsize=queue_size)
-    stop_event = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
 
-    # Start keyboard input thread for 'q' key to stop gracefully
+    # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
     keyboard_thread = threading.Thread(
         target=keyboard_input_thread,
         args=(stop_event,),

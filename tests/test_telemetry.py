@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -272,3 +274,71 @@ class TestTeleoperateTelemetryEnd:
                                 )
 
         mock_client.mqtt.publish_telemetry_end.assert_called_once_with("teleop-twin-789")
+
+
+class TestMainTeleoperateIntegration:
+    """Integration test: main starts teleoperate, stops it, verifies telemetry messages."""
+
+    def test_main_start_stop_teleoperate_produces_telemetry_messages(self):
+        """handle_command(teleoperate) then handle_command(stop) produces expected MQTT messages."""
+        import main as main_module
+
+        twin_uuid = "integration-twin-001"
+        mock_client = MagicMock()
+        mock_client.mqtt.connected = True
+        mock_client.mqtt.publish_telemetry_start = MagicMock()
+        mock_client.mqtt.publish_telemetry_end = MagicMock()
+        mock_client.mqtt._publish_disconnect_message = MagicMock()
+        mock_client.mqtt.publish_command_message = MagicMock()
+
+        mock_robot = MagicMock()
+        mock_robot.uuid = twin_uuid
+        mock_client.twin.return_value = mock_robot
+
+        cfg = {
+            "follower_port": "/dev/ttyUSB0",
+            "leader_port": "/dev/ttyUSB1",
+            "follower_id": "follower1",
+            "leader_id": "leader1",
+            "max_relative_target": None,
+            "cameras": [],
+        }
+
+        mock_leader = MagicMock()
+        mock_follower = MagicMock()
+
+        def _minimal_teleoperate(leader, cyberwave_client, follower, robot, cameras=None, stop_event=None, **kwargs):
+            """Minimal teleoperate that emits telemetry messages for integration test."""
+            mqtt = cyberwave_client.mqtt
+            mqtt.publish_telemetry_start(str(robot.uuid), {"fps": 100, "observations": {}})
+            try:
+                if stop_event:
+                    stop_event.wait(timeout=2.0)
+            finally:
+                mqtt.publish_telemetry_end(str(robot.uuid))
+
+        with patch.object(main_module, "_get_hardware_config", return_value=cfg):
+            with patch.object(main_module, "_is_follower_calibrated", return_value=True):
+                with patch.object(main_module, "_is_leader_calibrated", return_value=True):
+                    with patch("so101.follower.SO101Follower", return_value=mock_follower):
+                        with patch("so101.leader.SO101Leader", return_value=mock_leader):
+                            with patch(
+                                "scripts.cw_teleoperate.teleoperate",
+                                _minimal_teleoperate,
+                            ):
+                                # Start teleoperate
+                                main_module.handle_command(
+                                    mock_client, twin_uuid, "teleoperate", {}
+                                )
+
+                                time.sleep(0.3)
+
+                                # Stop
+                                main_module.handle_command(
+                                    mock_client, twin_uuid, "stop", {}
+                                )
+
+        # Verify telemetry messages
+        mock_client.mqtt.publish_telemetry_start.assert_called()
+        mock_client.mqtt.publish_telemetry_end.assert_called_with(twin_uuid)
+        mock_client.mqtt._publish_disconnect_message.assert_called_with(twin_uuid)

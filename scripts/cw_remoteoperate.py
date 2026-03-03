@@ -387,7 +387,7 @@ def remoteoperate(
         # Signal all threads to stop
         stop_event.set()
 
-        # Wait for queue to drain (with timeout)
+        # Wait for action queue to drain so pending joint updates are delivered
         try:
             action_queue.join(timeout=2.0)
         except Exception:
@@ -406,6 +406,14 @@ def remoteoperate(
         # Stop status thread
         if status_thread is not None:
             status_thread.join(timeout=1.0)
+
+        # Publish telemetry_end last, after queues drained; wait for MQTT delivery
+        if robot is not None and mqtt_client is not None:
+            try:
+                mqtt_client.publish_telemetry_end(str(robot.uuid))
+            except Exception:
+                if status_tracker:
+                    status_tracker.increment_errors_mqtt()
 
 
 def main():

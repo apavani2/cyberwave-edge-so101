@@ -33,6 +33,9 @@ _current_follower: Optional[object] = (
 # Stop event passed to remoteoperate/teleoperate so _stop_current_operation can
 # signal them to exit (used when run by edge-core in Docker, no terminal).
 _operation_stop_event: Optional[threading.Event] = None
+# Client and twin for connect/disconnect messages (main sends these; scripts send telemetry)
+_current_client: Optional[Cyberwave] = None
+_current_twin_uuid: Optional[str] = None
 
 # Calibration subprocess (Popen with stdin=PIPE) for "advance" command injection
 _calibration_proc: Optional[subprocess.Popen] = None
@@ -1023,11 +1026,12 @@ def _stop_current_operation() -> None:
     exit within the graceful timeout.
     """
     global _current_thread, _current_follower, _operation_stop_event, _calibration_proc
+    global _current_client, _current_twin_uuid
 
     # Stop teleoperate/remoteoperate gracefully
     if _current_thread is not None and _current_thread.is_alive():
         logger.info("Stopping current operation (graceful shutdown) …")
-        # 1. Signal scripts to exit (they will cleanup MQTT, cameras, etc.)
+        # 1. Signal scripts to exit (they will cleanup MQTT, send telemetry_end, etc.)
         if _operation_stop_event is not None:
             _operation_stop_event.set()
         # 2. Wait for thread to exit and cleanup
@@ -1044,9 +1048,18 @@ def _stop_current_operation() -> None:
             if _current_thread.is_alive():
                 logger.warning("Operation thread did not stop after force disconnect")
 
+        # 4. Main sends disconnect after script has exited (scripts send telemetry_end)
+        if _current_client is not None and _current_twin_uuid is not None:
+            try:
+                _current_client.mqtt._publish_disconnect_message(_current_twin_uuid)
+            except Exception:
+                logger.exception("Error publishing disconnect")
+
     _current_thread = None
     _current_follower = None
     _operation_stop_event = None
+    _current_client = None
+    _current_twin_uuid = None
 
     # Stop calibration subprocess gracefully (SIGTERM first, then SIGKILL)
     if _calibration_proc is not None:
@@ -1425,8 +1438,12 @@ def start_remoteoperate(client: Cyberwave, twin_uuid: str) -> None:
     launches the ``remoteoperate`` loop from :pymod:`scripts.cw_remoteoperate`.
     """
     global _current_thread, _current_follower, _operation_stop_event
+    global _current_client, _current_twin_uuid
 
     logger.info("Starting remoteoperate")
+
+    _current_client = client
+    _current_twin_uuid = twin_uuid
 
     cfg = _get_hardware_config(twin_uuid)
     follower_port = cfg["follower_port"]
@@ -1540,8 +1557,12 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
     and launches the ``teleoperate`` loop from :pymod:`scripts.cw_teleoperate`.
     """
     global _current_thread, _current_follower, _operation_stop_event
+    global _current_client, _current_twin_uuid
 
     logger.info("Starting teleoperate")
+
+    _current_client = client
+    _current_twin_uuid = twin_uuid
 
     cfg = _get_hardware_config(twin_uuid)
     follower_port = cfg["follower_port"]

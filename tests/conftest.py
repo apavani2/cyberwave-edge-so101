@@ -44,6 +44,7 @@ if "cyberwave" not in sys.modules:
     _sensor.Resolution = _FakeResolution
     _sensor.RealSenseConfig = type("RealSenseConfig", (), {})
     _sensor.RealSenseDiscovery = type("RealSenseDiscovery", (), {})
+    _sensor.CameraStreamManager = type("CameraStreamManager", (), {})
     sys.modules["cyberwave.sensor"] = _sensor
 
     _constants = types.ModuleType("cyberwave.constants")

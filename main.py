@@ -1660,7 +1660,7 @@ def start_teleoperate(client: Cyberwave, twin_uuid: str) -> None:
             cameras_list.append(entry)
 
         # Leader
-        leader_config = LeaderConfig(port=leader_port)
+        leader_config = LeaderConfig(port=leader_port, id=leader_id)
         leader = SO101Leader(config=leader_config)
         leader.connect()
 

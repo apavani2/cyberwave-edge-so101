@@ -1109,6 +1109,8 @@ def _run_calibration_with_advance(
         "--id",
         device_id,
     ]
+    if alert_uuid:
+        cmd.extend(["--alert-uuid", alert_uuid, "--twin-uuid", twin_uuid])
     logger.info("Starting calibration subprocess (stdin=PIPE): %s", " ".join(cmd))
 
     try:
@@ -1162,6 +1164,17 @@ def _handle_calibration_start(
     data: dict,
 ) -> None:
     """Start calibration subprocess in background with stdin=PIPE for advance commands."""
+    global _calibration_proc
+
+    # Reject concurrent calibration
+    if _calibration_proc is not None and _calibration_proc.poll() is None:
+        logger.warning("Calibration already running; rejecting start_calibration")
+        client.mqtt.publish_command_message(
+            twin_uuid,
+            {"status": "error", "reason": "calibration_already_running"},
+        )
+        return
+
     device_type = data.get("type") or "follower"
     port = (
         data.get("follower_port")
@@ -1177,6 +1190,19 @@ def _handle_calibration_start(
         return
 
     alert_uuid = data.get("alert_uuid")
+
+    # Update alert state immediately so frontend knows calibration started
+    if alert_uuid:
+        try:
+            robot = client.twin(twin_id=twin_uuid)
+            alert = robot.alerts.get(alert_uuid)
+            meta = dict(alert.metadata or {})
+            cal = dict(meta.get("calibration") or {})
+            cal["state"] = "started"
+            meta["calibration"] = cal
+            alert.update(metadata=meta)
+        except Exception:
+            logger.debug("Could not update alert state to started", exc_info=True)
 
     thread = threading.Thread(
         target=_run_calibration_with_advance,

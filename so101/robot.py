@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from motors import (
     FeetechMotorsBus,
@@ -118,8 +118,23 @@ class SO101Robot(abc.ABC):
     def calibration_fpath(self) -> Path:
         pass
 
-    def calibrate(self) -> None:
-        """Calibrate motors."""
+    def calibrate(
+        self,
+        on_state_change: Optional[Callable[[str], None]] = None,
+        on_joint_progress: Optional[
+            Callable[
+                [Dict[str, float], Dict[str, float], Dict[str, float]], None
+            ]
+        ] = None,
+    ) -> None:
+        """Calibrate motors.
+
+        Args:
+            on_state_change: Optional callback(state) when calibration step changes.
+                States: "zero_pose_waiting", "joint_calibration_waiting".
+            on_joint_progress: Optional callback(current, min, max) during joint
+                range recording, for live updates (e.g. to alert metadata).
+        """
         logger.info(f"\nRunning calibration of {self}")
         if not self.connected:
             raise DeviceNotConnectedError(f"{self} is not connected")
@@ -139,6 +154,12 @@ class SO101Robot(abc.ABC):
         self.bus.reset_homing_offsets()
         time.sleep(0.1)  # Brief delay for offsets to take effect
 
+        if on_state_change:
+            try:
+                on_state_change("zero_pose_waiting")
+            except Exception:
+                pass
+
         print(f"\nMove {self} to the middle of its range of motion.")
         print("Current positions:")
         self.bus.display_current_positions()
@@ -146,11 +167,19 @@ class SO101Robot(abc.ABC):
 
         homing_offsets = self.bus.set_half_turn_homings()
 
+        if on_state_change:
+            try:
+                on_state_change("joint_calibration_waiting")
+            except Exception:
+                pass
+
         print(
             "Move all joints sequentially through their entire ranges "
             "of motion.\nRecording positions. Press ENTER to stop..."
         )
-        range_mins, range_maxes = self.bus.record_ranges_of_motion()
+        range_mins, range_maxes = self.bus.record_ranges_of_motion(
+            on_progress=on_joint_progress
+        )
 
         self.calibration = {}
         for motor_name, motor in self.motors.items():

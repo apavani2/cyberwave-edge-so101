@@ -8,7 +8,9 @@ Example:
 
 import argparse
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,6 +22,9 @@ from utils.config import FollowerConfig, LeaderConfig
 from utils.utils import find_port, setup_logging
 
 logger = logging.getLogger(__name__)
+
+# Throttle joint progress updates to avoid API spam (seconds)
+JOINT_PROGRESS_THROTTLE = 1.5
 
 
 def main():
@@ -97,6 +102,16 @@ Examples:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--alert-uuid",
+        type=str,
+        help="Alert UUID to update with calibration state and joint progress (for frontend)",
+    )
+    parser.add_argument(
+        "--twin-uuid",
+        type=str,
+        help="Twin UUID (required when --alert-uuid is set, for fetching/updating alert)",
+    )
 
     args = parser.parse_args()
 
@@ -133,6 +148,65 @@ Examples:
 
     # Set default ID based on type if not provided
     device_id = args.id if args.id is not None else f"{args.type}1"
+
+    # Alert update helpers (when --alert-uuid and --twin-uuid provided)
+    alert_uuid = args.alert_uuid
+    twin_uuid = args.twin_uuid
+    update_alert = None
+    if alert_uuid and twin_uuid:
+        token = os.getenv("CYBERWAVE_API_KEY")
+        if token:
+            try:
+                from cyberwave import Cyberwave
+
+                _client = Cyberwave(token=token, source_type="edge")
+                _robot = _client.twin(twin_id=twin_uuid)
+                _alert = _robot.alerts.get(alert_uuid)
+
+                _calibration_meta = dict(_alert.metadata or {}).get("calibration") or {}
+
+                def _update_alert_metadata(calibration_updates: dict) -> None:
+                    try:
+                        _calibration_meta.update(calibration_updates)
+                        meta = dict(_alert.metadata or {})
+                        meta["calibration"] = dict(_calibration_meta)
+                        _alert.update(metadata=meta)
+                    except Exception as e:
+                        logger.debug("Failed to update alert metadata: %s", e)
+
+                update_alert = _update_alert_metadata
+                # Set initial state
+                _update_alert_metadata({"state": "started"})
+            except Exception as e:
+                logger.warning("Could not init alert update for calibration: %s", e)
+
+    _last_joint_progress_time = 0.0
+
+    def _on_state_change(state: str) -> None:
+        if update_alert:
+            update_alert({"state": state})
+
+    def _on_joint_progress(
+        current: dict, range_mins: dict, range_maxes: dict
+    ) -> None:
+        nonlocal _last_joint_progress_time
+        if not update_alert:
+            return
+        now = time.monotonic()
+        if now - _last_joint_progress_time < JOINT_PROGRESS_THROTTLE:
+            return
+        _last_joint_progress_time = now
+        joints = {}
+        for name in current:
+            min_val = range_mins.get(name, float("inf"))
+            max_val = range_maxes.get(name, float("-inf"))
+            joints[name] = {
+                "actual": round(current[name], 1),
+                "min": round(min_val, 1) if min_val != float("inf") else None,
+                "max": round(max_val, 1) if max_val != float("-inf") else None,
+                "status": "recording",
+            }
+        update_alert({"state": "joint_calibration_waiting", "joints": joints})
 
     try:
         # Create device instance
@@ -180,7 +254,12 @@ Examples:
         if args.type == "leader" or (args.type == "follower" and already_calibrated):
             # Perform calibration (will re-calibrate if already calibrated)
             logger.info("Starting calibration...")
-            device.calibrate()
+            device.calibrate(
+                on_state_change=_on_state_change if update_alert else None,
+                on_joint_progress=_on_joint_progress if update_alert else None,
+            )
+            if update_alert:
+                update_alert({"state": "completed", "joints": {}})
 
             # Save calibration
             logger.info("Saving calibration...")
@@ -208,11 +287,21 @@ Examples:
 
     except KeyboardInterrupt:
         logger.warning("\nCalibration interrupted by user")
+        if update_alert:
+            try:
+                update_alert({"state": "cancelled"})
+            except Exception:
+                pass
         if device.connected:
             device.disconnect()
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error during calibration: {e}", exc_info=True)
+        if update_alert:
+            try:
+                update_alert({"state": "error"})
+            except Exception:
+                pass
         if "device" in locals() and device.connected:
             device.disconnect()
         sys.exit(1)

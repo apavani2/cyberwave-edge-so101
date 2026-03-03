@@ -4,7 +4,7 @@ import logging
 import math
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from utils.errors import DeviceAlreadyConnectedError
 
@@ -1057,7 +1057,13 @@ class FeetechMotorsBus(MotorsBus):
         )
         print(display_text)
 
-    def record_ranges_of_motion(self, motor_names: Optional[List[str]] = None) -> tuple:
+    def record_ranges_of_motion(
+        self,
+        motor_names: Optional[List[str]] = None,
+        on_progress: Optional[
+            Callable[[Dict[str, float], Dict[str, float], Dict[str, float]], None]
+        ] = None,
+    ) -> tuple:
         """
         Record min and max positions while user moves joints.
 
@@ -1069,6 +1075,8 @@ class FeetechMotorsBus(MotorsBus):
 
         Args:
             motor_names: List of motor names to record. If None, records all motors.
+            on_progress: Optional callback(current_positions, range_mins, range_maxes)
+                called periodically during recording (e.g. for alert updates).
 
         Returns:
             Tuple of (range_mins, range_maxes) dictionaries mapping motor names to values
@@ -1173,6 +1181,16 @@ class FeetechMotorsBus(MotorsBus):
                     sys.stdout.write(warnings_text)
                 sys.stdout.write("\n\nPress ENTER to stop recording...")
                 sys.stdout.flush()
+
+                if on_progress is not None:
+                    try:
+                        on_progress(
+                            dict(current_positions),
+                            dict(range_mins),
+                            dict(range_maxes),
+                        )
+                    except Exception:
+                        pass  # Don't let callback break calibration
 
                 time.sleep(0.1)  # Update display at 10 Hz
 

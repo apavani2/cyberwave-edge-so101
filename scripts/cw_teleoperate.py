@@ -471,16 +471,23 @@ def teleoperate(
         if status_thread is not None:
             status_thread.join(timeout=1.0)
 
-        # Publish telemetry_end last, after queues drained; wait for MQTT delivery
+        # Publish telemetry_end last, after queues drained
         if robot is not None and mqtt_client is not None:
             logger = logging.getLogger(__name__)
+            twin_uuid = str(robot.uuid)
             logger.info(
                 "Publishing telemetry_end for twin %s (mqtt connected: %s)",
-                robot.uuid,
+                twin_uuid,
                 mqtt_client.connected if mqtt_client else "N/A",
             )
             try:
-                mqtt_client.publish_telemetry_end(str(robot.uuid))
+                if hasattr(mqtt_client, "publish_telemetry_end"):
+                    mqtt_client.publish_telemetry_end(twin_uuid)
+                else:
+                    # Fallback for older SDK versions without publish_telemetry_end
+                    topic = f"{mqtt_client.topic_prefix}cyberwave/twin/{twin_uuid}/telemetry"
+                    message = {"type": "telemetry_end", "timestamp": time.time()}
+                    mqtt_client.publish(topic, message)
                 logger.info("telemetry_end published successfully")
             except Exception:
                 logger.exception("Failed to publish telemetry_end")

@@ -195,4 +195,6 @@ def publish_initial_observations(
             "fps": fps,
             "observations": observations,
         }
+        logger.info("Publishing telemetry_start for twin %s", twin_uuid)
         mqtt_client.publish_telemetry_start(twin_uuid, metadata)
+        logger.info("telemetry_start published successfully")

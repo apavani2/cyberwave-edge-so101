@@ -1051,7 +1051,16 @@ def _stop_current_operation() -> None:
         # 4. Main sends disconnect after script has exited (scripts send telemetry_end)
         if _current_client is not None and _current_twin_uuid is not None:
             try:
-                _current_client.mqtt._publish_disconnect_message(_current_twin_uuid)
+                mqtt = _current_client.mqtt
+                if hasattr(mqtt, "publish_disconnected"):
+                    mqtt.publish_disconnected(_current_twin_uuid)
+                else:
+                    # Fallback for older SDK versions
+                    import time as _time
+
+                    topic = f"{mqtt.topic_prefix}cyberwave/twin/{_current_twin_uuid}/telemetry"
+                    message = {"type": "disconnected", "timestamp": _time.time()}
+                    mqtt.publish(topic, message)
             except Exception:
                 logger.exception("Error publishing disconnect")
 

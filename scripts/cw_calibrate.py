@@ -247,8 +247,18 @@ Examples:
         already_calibrated = calibration_path.exists()
 
         # Connect to device
+        # For uncalibrated followers, connect() runs calibration internally - pass callbacks
+        # so the frontend receives state updates (zero_pose_waiting, joint_calibration_waiting)
+        # and can show the "Go ahead" button.
         logger.info("Connecting to device...")
-        device.connect(calibrate=False)
+        if args.type == "follower" and not already_calibrated and update_alert:
+            device.connect(
+                calibrate=False,
+                on_state_change=_on_state_change,
+                on_joint_progress=_on_joint_progress,
+            )
+        else:
+            device.connect(calibrate=False)
         logger.info("Device connected successfully")
 
         if args.type == "leader" or (args.type == "follower" and already_calibrated):
@@ -269,6 +279,8 @@ Examples:
             # Follower that wasn't calibrated: connect() already calibrated and saved
             # Just ensure it's saved (redundant but safe)
             logger.info("Calibration completed during connection")
+            if update_alert:
+                update_alert({"state": "completed", "joints": {}})
             device.save_calibration()
             logger.info(f"Calibration saved to {calibration_path}")
 

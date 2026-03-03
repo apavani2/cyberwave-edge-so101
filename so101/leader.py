@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from serial.serialutil import SerialException
 
@@ -57,12 +57,23 @@ class SO101Leader(SO101Robot):
         """Check if leader is connected."""
         return self._connected and self.bus is not None and self.bus.connected
 
-    def connect(self, calibrate: bool = False) -> None:
+    def connect(
+        self,
+        calibrate: bool = False,
+        on_state_change: Optional[Callable[[str], None]] = None,
+        on_joint_progress: Optional[
+            Callable[[Dict[str, float], Dict[str, float], Dict[str, float]], None]
+        ] = None,
+    ) -> None:
         """
         Connect to the leader device.
 
         Args:
             calibrate: Whether to calibrate motors on connection
+            on_state_change: Optional callback(state) when calibration step changes.
+                Passed to calibrate() when running calibration. Used by frontend to show
+                "Go ahead" button at zero_pose_waiting / joint_calibration_waiting.
+            on_joint_progress: Optional callback for joint progress during calibration.
         """
         if self.connected:
             logger.warning("Leader is already connected")
@@ -88,7 +99,10 @@ class SO101Leader(SO101Robot):
 
         # Calibrate if requested, otherwise restore calibration to motors
         if calibrate:
-            self.calibrate()
+            self.calibrate(
+                on_state_change=on_state_change,
+                on_joint_progress=on_joint_progress,
+            )
         elif self.calibration:
             logger.info("Restoring calibration to leader motors (homing offset, position limits)")
             self.bus.write_calibration(self.calibration)

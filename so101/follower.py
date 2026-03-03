@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from serial.serialutil import SerialException
 
@@ -95,7 +95,14 @@ class SO101Follower(SO101Robot):
         """Check if follower is calibrated."""
         return self.calibration is not None
 
-    def connect(self, calibrate: bool = False) -> None:
+    def connect(
+        self,
+        calibrate: bool = False,
+        on_state_change: Optional[Callable[[str], None]] = None,
+        on_joint_progress: Optional[
+            Callable[[Dict[str, float], Dict[str, float], Dict[str, float]], None]
+        ] = None,
+    ) -> None:
         """
         Connect to the follower device.
 
@@ -107,6 +114,10 @@ class SO101Follower(SO101Robot):
         Args:
             calibrate: Whether to calibrate motors on connection if not already calibrated.
                       If False and not calibrated, will still force calibration
+            on_state_change: Optional callback(state) when calibration step changes.
+                Passed to calibrate() when running calibration. Used by frontend to show
+                "Go ahead" button at zero_pose_waiting / joint_calibration_waiting.
+            on_joint_progress: Optional callback for joint progress during calibration.
         """
         if self.connected:
             logger.warning("Follower is already connected")
@@ -119,11 +130,17 @@ class SO101Follower(SO101Robot):
         # Force calibration if not already calibrated
         if not self.is_calibrated:
             logger.info(f"{self} is not calibrated. Running calibration...")
-            self.calibrate()
+            self.calibrate(
+                on_state_change=on_state_change,
+                on_joint_progress=on_joint_progress,
+            )
         elif calibrate:
             # If already calibrated but calibrate=True, re-calibrate
             logger.info(f"{self} is already calibrated, but re-calibrating as requested...")
-            self.calibrate()
+            self.calibrate(
+                on_state_change=on_state_change,
+                on_joint_progress=on_joint_progress,
+            )
         elif self.calibration:
             # Restore calibration to motors (homing offset, position limits)
             logger.info("Restoring calibration to follower motors (homing offset, position limits)")

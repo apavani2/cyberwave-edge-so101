@@ -173,267 +173,269 @@ def teleoperate(
     """
     time_reference = TimeReference()
 
+    # Initialize variables that need cleanup tracking (set before try block)
+    mqtt_client = cyberwave_client.mqtt
+    worker_thread: Optional[threading.Thread] = None
+    camera_manager: Optional[CameraStreamManager] = None
+    status_thread: Optional[threading.Thread] = None
+    status_tracker = StatusTracker()
+    action_queue: Optional[queue.Queue] = None
+    telemetry_started = False
+
     # Disable all logging to avoid interfering with status display
     logging.disable(logging.CRITICAL)
 
-    # Build camera twins for CameraStreamManager from cameras (loaded from setup.json)
-    camera_twins: List[Any] = []
-    camera_fps = 30
-    if cameras:
-        for cfg in cameras:
-            twin = cfg["twin"]
-            overrides = {k: v for k, v in cfg.items() if k != "twin"}
-            camera_twins.append((twin, overrides) if overrides else twin)
-        camera_fps = cameras[0].get("fps", 30)
+    try:
+        # Build camera twins for CameraStreamManager from cameras (loaded from setup.json)
+        camera_twins: List[Any] = []
+        camera_fps = 30
+        if cameras:
+            for cfg in cameras:
+                twin = cfg["twin"]
+                overrides = {k: v for k, v in cfg.items() if k != "twin"}
+                camera_twins.append((twin, overrides) if overrides else twin)
+            camera_fps = cameras[0].get("fps", 30)
 
-    # Create status tracker
-    status_tracker = StatusTracker()
-    status_tracker.script_started = True
-    status_tracker.camera_enabled = len(camera_twins) > 0
+        # Create status tracker
+        status_tracker.script_started = True
+        status_tracker.camera_enabled = len(camera_twins) > 0
 
-    # Set twin info for status display (use first camera for display)
-    robot_uuid = robot.uuid
-    robot_name = robot.name if hasattr(robot, "name") else "so101-teleop"
+        # Set twin info for status display (use first camera for display)
+        robot_uuid = robot.uuid
+        robot_name = robot.name if hasattr(robot, "name") else "so101-teleop"
 
-    def _first_twin(twins: List[Any]):
-        if not twins:
-            return None
-        first = twins[0]
-        return first[0] if isinstance(first, tuple) else first
+        def _first_twin(twins: List[Any]):
+            if not twins:
+                return None
+            first = twins[0]
+            return first[0] if isinstance(first, tuple) else first
 
-    first_camera_twin = _first_twin(camera_twins)
-    camera_uuid_val = first_camera_twin.uuid if first_camera_twin else ""
-    camera_display_name = (
-        first_camera_twin.name if first_camera_twin and hasattr(first_camera_twin, "name") else ""
-    )
-    status_tracker.set_twin_info(robot_uuid, robot_name, camera_uuid_val, camera_display_name)
+        first_camera_twin = _first_twin(camera_twins)
+        camera_uuid_val = first_camera_twin.uuid if first_camera_twin else ""
+        camera_display_name = (
+            first_camera_twin.name if first_camera_twin and hasattr(first_camera_twin, "name") else ""
+        )
+        status_tracker.set_twin_info(robot_uuid, robot_name, camera_uuid_val, camera_display_name)
 
-    # Ensure MQTT client is connected
-    mqtt_client = cyberwave_client.mqtt
-    if mqtt_client is not None and not mqtt_client.connected:
-        mqtt_client.connect()
+        # Ensure MQTT client is connected
+        if mqtt_client is not None and not mqtt_client.connected:
+            mqtt_client.connect()
 
-        # Wait for connection with timeout
-        max_wait_time = 10.0  # seconds
-        wait_start = time.time()
-        while not mqtt_client.connected:
-            if time.time() - wait_start > max_wait_time:
-                status_tracker.update_mqtt_status(False)
-                raise RuntimeError(
-                    f"Failed to connect to Cyberwave MQTT broker within {max_wait_time} seconds"
-                )
-            time.sleep(0.1)
-        status_tracker.update_mqtt_status(True)
-    else:
-        status_tracker.update_mqtt_status(mqtt_client.connected if mqtt_client else False)
+            # Wait for connection with timeout
+            max_wait_time = 10.0  # seconds
+            wait_start = time.time()
+            while not mqtt_client.connected:
+                if time.time() - wait_start > max_wait_time:
+                    status_tracker.update_mqtt_status(False)
+                    raise RuntimeError(
+                        f"Failed to connect to Cyberwave MQTT broker within {max_wait_time} seconds"
+                    )
+                time.sleep(0.1)
+            status_tracker.update_mqtt_status(True)
+        else:
+            status_tracker.update_mqtt_status(mqtt_client.connected if mqtt_client else False)
 
-    if not leader.connected:
-        raise RuntimeError("Leader is not connected")
+        if not leader.connected:
+            raise RuntimeError("Leader is not connected")
 
-    if not follower.connected:
-        raise RuntimeError("Follower is not connected")
+        if not follower.connected:
+            raise RuntimeError("Follower is not connected")
 
-    # Verify follower has torque enabled (required for movement)
-    if not follower.torque_enabled:
-        follower.enable_torque()
+        # Verify follower has torque enabled (required for movement)
+        if not follower.torque_enabled:
+            follower.enable_torque()
 
-    # Check calibration for leader (required)
-    check_calibration_required(
-        leader,
-        "leader",
-        twin=robot,
-        require_calibration=True,
-    )
-    # Upload leader calibration to twin
-    upload_calibration_to_twin(leader, robot, "leader")
+        # Check calibration for leader (required)
+        check_calibration_required(
+            leader,
+            "leader",
+            twin=robot,
+            require_calibration=True,
+        )
+        # Upload leader calibration to twin
+        upload_calibration_to_twin(leader, robot, "leader")
 
-    # Check calibration for follower (required)
-    check_calibration_required(
-        follower,
-        "follower",
-        twin=robot,
-        require_calibration=True,
-    )
+        # Check calibration for follower (required)
+        check_calibration_required(
+            follower,
+            "follower",
+            twin=robot,
+            require_calibration=True,
+        )
 
-    # Upload follower calibration to twin if available
-    if follower.calibration is not None:
-        upload_calibration_to_twin(follower, robot, "follower")
+        # Upload follower calibration to twin if available
+        if follower.calibration is not None:
+            upload_calibration_to_twin(follower, robot, "follower")
 
-    # Use follower motors for mappings when sending to Cyberwave (follower data is what we send)
-    motors_for_mapping = follower.motors
+        # Use follower motors for mappings when sending to Cyberwave (follower data is what we send)
+        motors_for_mapping = follower.motors
 
-    # Resolve calibration: prefer local device, fallback to twin API
-    leader_calibration = resolve_calibration_for_edge(
-        robot,
-        leader.calibration,
-        "leader",
-    )
-    follower_calibration = resolve_calibration_for_edge(
-        robot,
-        follower.calibration,
-        "follower",
-    )
+        # Resolve calibration: prefer local device, fallback to twin API
+        leader_calibration = resolve_calibration_for_edge(
+            robot,
+            leader.calibration,
+            "leader",
+        )
+        follower_calibration = resolve_calibration_for_edge(
+            robot,
+            follower.calibration,
+            "follower",
+        )
 
-    # Build joint mappings from twin schema and SO101 motors
-    mappings = build_joint_mappings(robot, motors_for_mapping)
-    motor_id_to_schema_joint = mappings["motor_id_to_schema_joint"]
-    joint_index_to_name = mappings["joint_index_to_name"]
-    joint_name_to_norm_mode = mappings["joint_name_to_norm_mode"]
-    joint_name_to_index = {name: mid for mid, name in joint_index_to_name.items()}
+        # Build joint mappings from twin schema and SO101 motors
+        mappings = build_joint_mappings(robot, motors_for_mapping)
+        motor_id_to_schema_joint = mappings["motor_id_to_schema_joint"]
+        joint_index_to_name = mappings["joint_index_to_name"]
+        joint_name_to_norm_mode = mappings["joint_name_to_norm_mode"]
+        joint_name_to_index = {name: mid for mid, name in joint_index_to_name.items()}
 
-    joint_index_to_name_str = {str(mid): name for mid, name in joint_index_to_name.items()}
-    status_tracker.set_joint_index_to_name(joint_index_to_name_str)
+        joint_index_to_name_str = {str(mid): name for mid, name in joint_index_to_name.items()}
+        status_tracker.set_joint_index_to_name(joint_index_to_name_str)
 
-    # Send telemetry_start with both leader and follower observations before any joint updates.
-    # This registers the twin so no duplicate telemetry_start is sent by the worker or camera.
-    if robot is not None and mqtt_client is not None:
-        try:
-            publish_initial_observations(
-                leader=leader,
-                follower=follower,
-                robot=robot,
-                mqtt_client=mqtt_client,
-                leader_calibration=leader_calibration,
-                follower_calibration=follower_calibration,
-                joint_name_to_norm_mode=joint_name_to_norm_mode,
-                motor_id_to_schema_joint=motor_id_to_schema_joint,
-                fps=CONTROL_RATE_HZ,
-            )
-        except Exception:
-            if status_tracker:
-                status_tracker.increment_errors_mqtt()
+        # ALWAYS send telemetry_start with initial observations before any joint updates.
+        # This registers the twin so no duplicate telemetry_start is sent by the worker or camera.
+        publish_initial_observations(
+            leader=leader,
+            follower=follower,
+            robot=robot,
+            mqtt_client=mqtt_client,
+            leader_calibration=leader_calibration,
+            follower_calibration=follower_calibration,
+            joint_name_to_norm_mode=joint_name_to_norm_mode,
+            motor_id_to_schema_joint=motor_id_to_schema_joint,
+            fps=CONTROL_RATE_HZ,
+        )
+        telemetry_started = True
 
-    # Initialize last observation state per source (track normalized positions for threshold filtering)
-    last_observation_leader: Dict[str, float] = {}
-    last_observation_follower: Dict[str, float] = {}
-    for joint_name in motors_for_mapping.keys():
-        last_observation_leader[joint_name] = float("inf")  # Use inf to force first update
-        last_observation_follower[joint_name] = float("inf")
+        # Initialize last observation state per source (track normalized positions for threshold filtering)
+        last_observation_leader: Dict[str, float] = {}
+        last_observation_follower: Dict[str, float] = {}
+        for joint_name in motors_for_mapping.keys():
+            last_observation_leader[joint_name] = float("inf")  # Use inf to force first update
+            last_observation_follower[joint_name] = float("inf")
 
-    # Create queue and worker thread for Cyberwave updates
-    num_joints = len(motors_for_mapping)
-    sampling_rate = 100  # Hz
-    seconds = 60  # seconds
-    queue_size = num_joints * sampling_rate * seconds
-    action_queue = queue.Queue(maxsize=queue_size)  # Limit queue size to prevent memory issues
-    if stop_event is None:
-        stop_event = threading.Event()
+        # Create queue and worker thread for Cyberwave updates
+        num_joints = len(motors_for_mapping)
+        sampling_rate = 100  # Hz
+        seconds = 60  # seconds
+        queue_size = num_joints * sampling_rate * seconds
+        action_queue = queue.Queue(maxsize=queue_size)  # Limit queue size to prevent memory issues
+        if stop_event is None:
+            stop_event = threading.Event()
 
-    # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
-    keyboard_thread = threading.Thread(
-        target=keyboard_input_thread,
-        args=(stop_event,),
-        daemon=True,
-    )
-    keyboard_thread.start()
-
-    # Start status logging thread
-    status_thread = threading.Thread(
-        target=run_status_logging_thread,
-        args=(status_tracker, stop_event, CONTROL_RATE_HZ, camera_fps),
-        kwargs={
-            "leader": leader,
-            "follower": follower,
-            "robot": robot,
-            "mode": "teleoperate",
-        },
-        daemon=True,
-    )
-    status_thread.start()
-
-    # Start MQTT update worker thread
-    worker_thread = None
-    if robot is not None:
-        worker_thread = threading.Thread(
-            target=cyberwave_update_worker,
-            args=(
-                action_queue,
-                joint_name_to_index,
-                joint_name_to_norm_mode,
-                stop_event,
-                robot,
-                status_tracker,
-                follower_calibration,
-                motor_id_to_schema_joint,
-            ),
+        # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
+        keyboard_thread = threading.Thread(
+            target=keyboard_input_thread,
+            args=(stop_event,),
             daemon=True,
         )
-        worker_thread.start()
+        keyboard_thread.start()
 
-    # Start camera streaming via SDK CameraStreamManager (one stream per twin, each with own thread)
-    camera_manager: Optional[CameraStreamManager] = None
-    if camera_twins and cyberwave_client is not None:
-        # Enrich overrides with camera_id from follower and fps where not set
-        follower_cameras = (
-            follower.config.cameras if follower is not None and follower.config.cameras else []
+        # Start status logging thread
+        status_thread = threading.Thread(
+            target=run_status_logging_thread,
+            args=(status_tracker, stop_event, CONTROL_RATE_HZ, camera_fps),
+            kwargs={
+                "leader": leader,
+                "follower": follower,
+                "robot": robot,
+                "mode": "teleoperate",
+            },
+            daemon=True,
         )
-        enriched_twins: List[Any] = []
-        for idx, item in enumerate(camera_twins):
-            if isinstance(item, tuple):
-                twin, overrides = item
-                overrides = dict(overrides)
-            else:
-                twin = item
-                overrides = {}
-            if "camera_id" not in overrides:
-                overrides["camera_id"] = follower_cameras[idx] if idx < len(follower_cameras) else 0
-            overrides.setdefault("fps", camera_fps)
-            enriched_twins.append((twin, overrides))
+        status_thread.start()
 
-        # Build camera infos for per-camera status display
-        camera_infos = []
-        for item in enriched_twins:
-            if isinstance(item, tuple):
-                twin, overrides = item
-            else:
-                twin, overrides = item, {}
-            cam_name = overrides.get("camera_name")
-            if not cam_name:
-                sensors = getattr(twin, "capabilities", {}).get("sensors", [])
-                cam_name = (
-                    sensors[0].get("id", "default")
-                    if sensors and isinstance(sensors[0], dict)
-                    else "default"
-                )
-            camera_infos.append({"uuid": str(twin.uuid), "name": cam_name})
-        status_tracker.set_camera_infos(camera_infos)
+        # Start MQTT update worker thread
+        if robot is not None:
+            worker_thread = threading.Thread(
+                target=cyberwave_update_worker,
+                args=(
+                    action_queue,
+                    joint_name_to_index,
+                    joint_name_to_norm_mode,
+                    stop_event,
+                    robot,
+                    status_tracker,
+                    follower_calibration,
+                    motor_id_to_schema_joint,
+                ),
+                daemon=True,
+            )
+            worker_thread.start()
 
-        def command_callback(status: str, msg: str, camera_name: str = "default"):
-            if status_tracker:
-                msg_lower = msg.lower()
-                if "started" in msg_lower or (
-                    status == "ok" and ("streaming" in msg_lower or "running" in msg_lower)
-                ):
-                    status_tracker.update_webrtc_state(camera_name, "streaming")
-                    status_tracker.update_camera_status(camera_name, detected=True, started=True)
-                elif status == "connecting" or "starting" in msg_lower:
-                    status_tracker.update_webrtc_state(camera_name, "connecting")
-                elif status == "error":
-                    status_tracker.update_webrtc_state(camera_name, "idle")
-                elif "stopped" in msg_lower:
-                    status_tracker.update_webrtc_state(camera_name, "idle")
-                    status_tracker.update_camera_status(camera_name, detected=True, started=False)
+        # Start camera streaming via SDK CameraStreamManager (one stream per twin, each with own thread)
+        if camera_twins and cyberwave_client is not None:
+            # Enrich overrides with camera_id from follower and fps where not set
+            follower_cameras = (
+                follower.config.cameras if follower is not None and follower.config.cameras else []
+            )
+            enriched_twins: List[Any] = []
+            for idx, item in enumerate(camera_twins):
+                if isinstance(item, tuple):
+                    twin, overrides = item
+                    overrides = dict(overrides)
+                else:
+                    twin = item
+                    overrides = {}
+                if "camera_id" not in overrides:
+                    overrides["camera_id"] = follower_cameras[idx] if idx < len(follower_cameras) else 0
+                overrides.setdefault("fps", camera_fps)
+                enriched_twins.append((twin, overrides))
 
-        for info in camera_infos:
-            cam_name = info["name"]
-            status_tracker.update_camera_status(cam_name, detected=True, started=False)
-            status_tracker.update_webrtc_state(cam_name, "connecting")
+            # Build camera infos for per-camera status display
+            camera_infos = []
+            for item in enriched_twins:
+                if isinstance(item, tuple):
+                    twin, overrides = item
+                else:
+                    twin, overrides = item, {}
+                cam_name = overrides.get("camera_name")
+                if not cam_name:
+                    sensors = getattr(twin, "capabilities", {}).get("sensors", [])
+                    cam_name = (
+                        sensors[0].get("id", "default")
+                        if sensors and isinstance(sensors[0], dict)
+                        else "default"
+                    )
+                camera_infos.append({"uuid": str(twin.uuid), "name": cam_name})
+            status_tracker.set_camera_infos(camera_infos)
 
-        camera_manager = CameraStreamManager(
-            client=cyberwave_client,
-            twins=enriched_twins,
-            stop_event=stop_event,
-            time_reference=time_reference,
-            command_callback=command_callback,
-        )
-        camera_manager.start()
-    else:
-        status_tracker.camera_states.clear()
+            def command_callback(status: str, msg: str, camera_name: str = "default"):
+                if status_tracker:
+                    msg_lower = msg.lower()
+                    if "started" in msg_lower or (
+                        status == "ok" and ("streaming" in msg_lower or "running" in msg_lower)
+                    ):
+                        status_tracker.update_webrtc_state(camera_name, "streaming")
+                        status_tracker.update_camera_status(camera_name, detected=True, started=True)
+                    elif status == "connecting" or "starting" in msg_lower:
+                        status_tracker.update_webrtc_state(camera_name, "connecting")
+                    elif status == "error":
+                        status_tracker.update_webrtc_state(camera_name, "idle")
+                    elif "stopped" in msg_lower:
+                        status_tracker.update_webrtc_state(camera_name, "idle")
+                        status_tracker.update_camera_status(camera_name, detected=True, started=False)
 
-    # TimeReference synchronization: teleop loop runs at 100Hz for control and MQTT updates.
-    status_tracker.fps = CONTROL_RATE_HZ
+            for info in camera_infos:
+                cam_name = info["name"]
+                status_tracker.update_camera_status(cam_name, detected=True, started=False)
+                status_tracker.update_webrtc_state(cam_name, "connecting")
 
-    try:
+            camera_manager = CameraStreamManager(
+                client=cyberwave_client,
+                twins=enriched_twins,
+                stop_event=stop_event,
+                time_reference=time_reference,
+                command_callback=command_callback,
+            )
+            camera_manager.start()
+        else:
+            status_tracker.camera_states.clear()
+
+        # TimeReference synchronization: teleop loop runs at 100Hz for control and MQTT updates.
+        status_tracker.fps = CONTROL_RATE_HZ
+
+        # Run the main teleop loop
         if leader is not None:
             teleop_loop(
                 leader=leader,
@@ -450,20 +452,24 @@ def teleoperate(
             # No leader, just wait for stop event
             while not stop_event.is_set():
                 time.sleep(0.1)
+
     finally:
         # Re-enable logging for cleanup diagnostics
         logging.disable(logging.NOTSET)
+        cleanup_logger = logging.getLogger(__name__)
 
         # Signal all threads to stop
-        stop_event.set()
+        if stop_event is not None:
+            stop_event.set()
 
         # Wait for action queue to drain so pending joint updates are delivered
         if worker_thread is not None:
             try:
-                action_queue.join(timeout=2.0)
+                if action_queue is not None:
+                    action_queue.join()
             except Exception:
                 pass
-            worker_thread.join(timeout=1.0)
+            worker_thread.join(timeout=2.0)
 
         if camera_manager is not None:
             camera_manager.join(timeout=5.0)
@@ -471,31 +477,28 @@ def teleoperate(
         if status_thread is not None:
             status_thread.join(timeout=1.0)
 
-        # Publish telemetry_end last, after queues drained
-        if robot is not None and mqtt_client is not None:
-            logger = logging.getLogger(__name__)
-            twin_uuid = str(robot.uuid)
-            logger.info(
-                "Publishing telemetry_end for twin %s (mqtt connected: %s)",
-                twin_uuid,
-                mqtt_client.connected if mqtt_client else "N/A",
-            )
-            try:
-                if hasattr(mqtt_client, "publish_telemetry_end"):
-                    mqtt_client.publish_telemetry_end(twin_uuid)
-                else:
-                    # Fallback for older SDK versions without publish_telemetry_end
-                    topic = f"{mqtt_client.topic_prefix}cyberwave/twin/{twin_uuid}/telemetry"
-                    message = {"type": "telemetry_end", "timestamp": time.time()}
-                    mqtt_client.publish(topic, message)
-                logger.info("telemetry_end published successfully")
-            except Exception:
-                logger.exception("Failed to publish telemetry_end")
-                if status_tracker:
-                    status_tracker.increment_errors_mqtt()
-        else:
-            logger = logging.getLogger(__name__)
-            logger.info("No robot or MQTT client; skipping telemetry_end")
+        # ALWAYS publish telemetry_end, regardless of whether telemetry_start succeeded
+        # This ensures the backend knows the session ended
+        twin_uuid = str(robot.uuid)
+        cleanup_logger.info(
+            "Publishing telemetry_end for twin %s (mqtt connected: %s, telemetry_started: %s)",
+            twin_uuid,
+            mqtt_client.connected if mqtt_client else "N/A",
+            telemetry_started,
+        )
+        try:
+            if hasattr(mqtt_client, "publish_telemetry_end"):
+                mqtt_client.publish_telemetry_end(twin_uuid)
+            else:
+                # Fallback for older SDK versions without publish_telemetry_end
+                topic = f"{mqtt_client.topic_prefix}cyberwave/twin/{twin_uuid}/telemetry"
+                message = {"type": "telemetry_end", "timestamp": time.time()}
+                mqtt_client.publish(topic, message)
+            cleanup_logger.info("telemetry_end published successfully")
+        except Exception:
+            cleanup_logger.exception("Failed to publish telemetry_end")
+            if status_tracker:
+                status_tracker.increment_errors_mqtt()
 
 
 def main():

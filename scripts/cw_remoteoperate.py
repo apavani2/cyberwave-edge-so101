@@ -71,336 +71,346 @@ def remoteoperate(
     """
     time_reference = TimeReference()
 
+    # Initialize variables that need cleanup tracking (set before try block)
+    mqtt_client = client.mqtt
+    status_tracker = StatusTracker()
+    camera_manager: Optional[CameraStreamManager] = None
+    status_thread: Optional[threading.Thread] = None
+    heartbeat_thread: Optional[threading.Thread] = None
+    writer_thread: Optional[threading.Thread] = None
+    action_queue: Optional[queue.Queue] = None
+    telemetry_started = False
+
     # Disable all logging to avoid interfering with status display
     logging.disable(logging.CRITICAL)
 
-    # Build camera twins for CameraStreamManager from cameras (loaded from setup.json)
-    camera_twins: List[Any] = []
-    camera_fps = 30
-    if cameras:
-        for cfg in cameras:
-            twin = cfg["twin"]
-            overrides = {k: v for k, v in cfg.items() if k != "twin"}
-            camera_twins.append((twin, overrides) if overrides else twin)
-        camera_fps = cameras[0].get("fps", 30)
-
-    # Create status tracker
-    status_tracker = StatusTracker()
-    status_tracker.script_started = True
-    status_tracker.camera_enabled = len(camera_twins) > 0
-
-    # Set twin info for status display (use first camera for display)
-    robot_uuid = robot.uuid if robot else ""
-    robot_name = robot.name if robot and hasattr(robot, "name") else "so101-remote"
-
-    def _first_twin(twins: List[Any]):
-        if not twins:
-            return None
-        first = twins[0]
-        return first[0] if isinstance(first, tuple) else first
-
-    first_camera_twin = _first_twin(camera_twins)
-    camera_uuid_val = first_camera_twin.uuid if first_camera_twin else ""
-    camera_display_name = (
-        first_camera_twin.name if first_camera_twin and hasattr(first_camera_twin, "name") else ""
-    )
-    status_tracker.set_twin_info(robot_uuid, robot_name, camera_uuid_val, camera_display_name)
-
-    # Get twin_uuid from robot twin
-    if robot is None:
-        raise RuntimeError("Robot twin is required")
-    twin_uuid = robot.uuid
-
-    # Ensure follower is connected
-    if not follower.connected:
-        raise RuntimeError("Follower is not connected")
-
-    # Verify follower has torque enabled (required for movement)
-    if not follower.torque_enabled:
-        follower.enable_torque()
-
-    # Check calibration - required for accurate positioning
-    check_calibration_required(
-        follower,
-        "follower",
-        twin=robot,
-        require_calibration=True,
-    )
-
-    # Upload follower calibration to twin if available
-    if follower.calibration is not None:
-        upload_calibration_to_twin(follower, robot, "follower")
-
-    # Resolve calibration: prefer local device, fallback to twin API
-    follower_calibration = resolve_calibration_for_edge(
-        robot,
-        follower.calibration if follower is not None else None,
-        "follower",
-    )
-
-    # Build joint mappings from twin schema and SO101 motors
-    mappings = build_joint_mappings(robot, follower.motors if follower else None)
-    joint_index_to_name = mappings["joint_index_to_name"]
-    joint_name_to_norm_mode = mappings["joint_name_to_norm_mode"]
-    motor_id_to_schema_joint = mappings["motor_id_to_schema_joint"]
-    schema_joint_to_motor_id = mappings["schema_joint_to_motor_id"]
-
-    joint_index_to_name_str = {str(motor.id): name for name, motor in follower.motors.items()}
-    status_tracker.set_joint_index_to_name(joint_index_to_name_str)
-
-    # Initialize current state with follower's current observation
-    current_state: Dict[str, float] = {}
-    initial_joint_states_radians: Dict[str, float] = {}  # For status display
     try:
-        # get_observation() handles SerialException internally and returns last known positions
-        initial_obs = follower.get_observation()
-        current_state.update(initial_obs)
+        # Build camera twins for CameraStreamManager from cameras (loaded from setup.json)
+        camera_twins: List[Any] = []
+        camera_fps = 30
+        if cameras:
+            for cfg in cameras:
+                twin = cfg["twin"]
+                overrides = {k: v for k, v in cfg.items() if k != "twin"}
+                camera_twins.append((twin, overrides) if overrides else twin)
+            camera_fps = cameras[0].get("fps", 30)
 
-        # Convert to radians for status display
-        for joint_key, normalized_pos in initial_obs.items():
-            name = joint_key.removesuffix(".pos")
-            if name in follower.motors:
+        # Create status tracker
+        status_tracker.script_started = True
+        status_tracker.camera_enabled = len(camera_twins) > 0
+
+        # Set twin info for status display (use first camera for display)
+        robot_uuid = robot.uuid if robot else ""
+        robot_name = robot.name if robot and hasattr(robot, "name") else "so101-remote"
+
+        def _first_twin(twins: List[Any]):
+            if not twins:
+                return None
+            first = twins[0]
+            return first[0] if isinstance(first, tuple) else first
+
+        first_camera_twin = _first_twin(camera_twins)
+        camera_uuid_val = first_camera_twin.uuid if first_camera_twin else ""
+        camera_display_name = (
+            first_camera_twin.name if first_camera_twin and hasattr(first_camera_twin, "name") else ""
+        )
+        status_tracker.set_twin_info(robot_uuid, robot_name, camera_uuid_val, camera_display_name)
+
+        # Get twin_uuid from robot twin
+        if robot is None:
+            raise RuntimeError("Robot twin is required")
+        twin_uuid = robot.uuid
+
+        # Ensure follower is connected
+        if not follower.connected:
+            raise RuntimeError("Follower is not connected")
+
+        # Verify follower has torque enabled (required for movement)
+        if not follower.torque_enabled:
+            follower.enable_torque()
+
+        # Check calibration - required for accurate positioning
+        check_calibration_required(
+            follower,
+            "follower",
+            twin=robot,
+            require_calibration=True,
+        )
+
+        # Upload follower calibration to twin if available
+        if follower.calibration is not None:
+            upload_calibration_to_twin(follower, robot, "follower")
+
+        # Resolve calibration: prefer local device, fallback to twin API
+        follower_calibration = resolve_calibration_for_edge(
+            robot,
+            follower.calibration if follower is not None else None,
+            "follower",
+        )
+
+        # Build joint mappings from twin schema and SO101 motors
+        mappings = build_joint_mappings(robot, follower.motors if follower else None)
+        joint_index_to_name = mappings["joint_index_to_name"]
+        joint_name_to_norm_mode = mappings["joint_name_to_norm_mode"]
+        motor_id_to_schema_joint = mappings["motor_id_to_schema_joint"]
+        schema_joint_to_motor_id = mappings["schema_joint_to_motor_id"]
+
+        joint_index_to_name_str = {str(motor.id): name for name, motor in follower.motors.items()}
+        status_tracker.set_joint_index_to_name(joint_index_to_name_str)
+
+        # Initialize current state with follower's current observation
+        current_state: Dict[str, float] = {}
+        initial_joint_states_radians: Dict[str, float] = {}  # For status display
+        try:
+            # get_observation() handles SerialException internally and returns last known positions
+            initial_obs = follower.get_observation()
+            current_state.update(initial_obs)
+
+            # Convert to radians for status display
+            for joint_key, normalized_pos in initial_obs.items():
+                name = joint_key.removesuffix(".pos")
+                if name in follower.motors:
+                    joint_index = follower.motors[name].id
+                    norm_mode = joint_name_to_norm_mode[name]
+                    calib = follower_calibration.get(name) if follower_calibration else None
+                    radians = normalized_to_radians(normalized_pos, norm_mode, calib)
+                    initial_joint_states_radians[str(joint_index)] = radians
+        except Exception:
+            # Initialize with empty state if get_observation() fails for other reasons
+            for name in follower.motors.keys():
+                current_state[f"{name}.pos"] = 0.0
                 joint_index = follower.motors[name].id
-                norm_mode = joint_name_to_norm_mode[name]
+                initial_joint_states_radians[str(joint_index)] = 0.0
+
+        # Populate initial joint states in status tracker (so we never show "waiting")
+        status_tracker.update_joint_states(initial_joint_states_radians)
+
+        # Ensure MQTT client is connected
+        if mqtt_client is not None and not mqtt_client.connected:
+            mqtt_client.connect()
+
+            # Wait for connection with timeout
+            max_wait_time = 10.0  # seconds
+            wait_start = time.time()
+            while not mqtt_client.connected:
+                if time.time() - wait_start > max_wait_time:
+                    status_tracker.update_mqtt_status(False)
+                    raise RuntimeError(
+                        f"Failed to connect to Cyberwave MQTT broker within {max_wait_time} seconds"
+                    )
+                time.sleep(0.1)
+            status_tracker.update_mqtt_status(True)
+        else:
+            status_tracker.update_mqtt_status(mqtt_client.connected if mqtt_client else False)
+
+        # ALWAYS send telemetry_start with follower observations before any joint updates.
+        # This registers the twin so no duplicate telemetry_start is sent by heartbeat or camera.
+        publish_initial_observations(
+            leader=None,
+            follower=follower,
+            robot=robot,
+            mqtt_client=mqtt_client,
+            leader_calibration=None,
+            follower_calibration=follower_calibration,
+            joint_name_to_norm_mode=joint_name_to_norm_mode,
+            motor_id_to_schema_joint=motor_id_to_schema_joint,
+            fps=CONTROL_RATE_HZ,
+        )
+        telemetry_started = True
+
+        # Send initial position per joint for real-time display (heartbeat will continue)
+        try:
+            follower_obs = follower.get_observation()
+            timestamp = time.time()
+            for joint_key, normalized_pos in follower_obs.items():
+                name = joint_key.removesuffix(".pos")
+                if name not in follower.motors:
+                    continue
+                joint_index = follower.motors[name].id
+                norm_mode = joint_name_to_norm_mode.get(name)
+                if norm_mode is None:
+                    continue
+                schema_joint = motor_id_to_schema_joint.get(joint_index, f"_{joint_index}")
                 calib = follower_calibration.get(name) if follower_calibration else None
                 radians = normalized_to_radians(normalized_pos, norm_mode, calib)
-                initial_joint_states_radians[str(joint_index)] = radians
-    except Exception:
-        # Initialize with empty state if get_observation() fails for other reasons
-        for name in follower.motors.keys():
-            current_state[f"{name}.pos"] = 0.0
-            joint_index = follower.motors[name].id
-            initial_joint_states_radians[str(joint_index)] = 0.0
-
-    # Populate initial joint states in status tracker (so we never show "waiting")
-    status_tracker.update_joint_states(initial_joint_states_radians)
-
-    # Ensure MQTT client is connected
-    mqtt_client = client.mqtt
-    if mqtt_client is not None and not mqtt_client.connected:
-        mqtt_client.connect()
-
-        # Wait for connection with timeout
-        max_wait_time = 10.0  # seconds
-        wait_start = time.time()
-        while not mqtt_client.connected:
-            if time.time() - wait_start > max_wait_time:
-                status_tracker.update_mqtt_status(False)
-                raise RuntimeError(
-                    f"Failed to connect to Cyberwave MQTT broker within {max_wait_time} seconds"
+                mqtt_client.update_joint_state(
+                    twin_uuid=twin_uuid,
+                    joint_name=schema_joint,
+                    position=radians,
+                    timestamp=timestamp,
+                    source_type=SOURCE_TYPE_EDGE_FOLLOWER,
                 )
-            time.sleep(0.1)
-        status_tracker.update_mqtt_status(True)
-    else:
-        status_tracker.update_mqtt_status(mqtt_client.connected if mqtt_client else False)
 
-    # Send telemetry_start with follower observations before any joint updates.
-    # This registers the twin so no duplicate telemetry_start is sent by heartbeat or camera.
-    if robot is not None and mqtt_client is not None:
-        try:
-            publish_initial_observations(
-                leader=None,
-                follower=follower,
-                robot=robot,
-                mqtt_client=mqtt_client,
-                leader_calibration=None,
-                follower_calibration=follower_calibration,
-                joint_name_to_norm_mode=joint_name_to_norm_mode,
-                motor_id_to_schema_joint=motor_id_to_schema_joint,
-                fps=CONTROL_RATE_HZ,
-            )
         except Exception:
             if status_tracker:
                 status_tracker.increment_errors_mqtt()
 
-    # Send initial position per joint for real-time display (heartbeat will continue)
-    try:
-        follower_obs = follower.get_observation()
-        timestamp = time.time()
-        for joint_key, normalized_pos in follower_obs.items():
-            name = joint_key.removesuffix(".pos")
-            if name not in follower.motors:
-                continue
-            joint_index = follower.motors[name].id
-            norm_mode = joint_name_to_norm_mode.get(name)
-            if norm_mode is None:
-                continue
-            schema_joint = motor_id_to_schema_joint.get(joint_index, f"_{joint_index}")
-            calib = follower_calibration.get(name) if follower_calibration else None
-            radians = normalized_to_radians(normalized_pos, norm_mode, calib)
-            mqtt_client.update_joint_state(
-                twin_uuid=twin_uuid,
-                joint_name=schema_joint,
-                position=radians,
-                timestamp=timestamp,
-                source_type=SOURCE_TYPE_EDGE_FOLLOWER,
+        # Create queue for actions
+        queue_size = 1000  # Reasonable queue size
+        action_queue = queue.Queue(maxsize=queue_size)
+        if stop_event is None:
+            stop_event = threading.Event()
+
+        # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
+        keyboard_thread = threading.Thread(
+            target=keyboard_input_thread,
+            args=(stop_event,),
+            daemon=True,
+        )
+        keyboard_thread.start()
+
+        # Start status logging thread
+        status_thread = threading.Thread(
+            target=run_status_logging_thread,
+            args=(status_tracker, stop_event, CONTROL_RATE_HZ, camera_fps),
+            kwargs={
+                "follower": follower,
+                "robot": robot,
+                "mode": "remoteoperate",
+            },
+            daemon=True,
+        )
+        status_thread.start()
+
+        # Start joint position heartbeat thread - publish follower position every second to avoid mismatches
+        heartbeat_thread = threading.Thread(
+            target=joint_position_heartbeat_thread,
+            args=(
+                follower,
+                mqtt_client,
+                twin_uuid,
+                joint_name_to_norm_mode,
+                follower_calibration,
+                motor_id_to_schema_joint,
+                stop_event,
+            ),
+            kwargs={"interval": 1.0},
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+        # Start camera streaming via SDK CameraStreamManager (one stream per twin, each with own thread)
+        if camera_twins and client is not None:
+            # Enrich overrides with camera_id from follower and fps where not set
+            follower_cameras = (
+                follower.config.cameras if follower is not None and follower.config.cameras else []
             )
+            enriched_twins: List[Any] = []
+            for idx, item in enumerate(camera_twins):
+                if isinstance(item, tuple):
+                    twin, overrides = item
+                    overrides = dict(overrides)
+                else:
+                    twin = item
+                    overrides = {}
+                if "camera_id" not in overrides:
+                    overrides["camera_id"] = follower_cameras[idx] if idx < len(follower_cameras) else 0
+                overrides.setdefault("fps", camera_fps)
+                enriched_twins.append((twin, overrides))
 
-    except Exception:
-        if status_tracker:
-            status_tracker.increment_errors_mqtt()
+            # Build camera infos for per-camera status display
+            camera_infos = []
+            for item in enriched_twins:
+                if isinstance(item, tuple):
+                    twin, overrides = item
+                else:
+                    twin, overrides = item, {}
+                cam_name = overrides.get("camera_name")
+                if not cam_name:
+                    sensors = getattr(twin, "capabilities", {}).get("sensors", [])
+                    cam_name = (
+                        sensors[0].get("id", "default")
+                        if sensors and isinstance(sensors[0], dict)
+                        else "default"
+                    )
+                camera_infos.append({"uuid": str(twin.uuid), "name": cam_name})
+            status_tracker.set_camera_infos(camera_infos)
 
-    # Create queue for actions
-    queue_size = 1000  # Reasonable queue size
-    action_queue = queue.Queue(maxsize=queue_size)
-    if stop_event is None:
-        stop_event = threading.Event()
+            def command_callback(status: str, msg: str, camera_name: str = "default"):
+                if status_tracker:
+                    msg_lower = msg.lower()
+                    if "started" in msg_lower or (
+                        status == "ok" and ("streaming" in msg_lower or "running" in msg_lower)
+                    ):
+                        status_tracker.update_webrtc_state(camera_name, "streaming")
+                        status_tracker.update_camera_status(camera_name, detected=True, started=True)
+                    elif status == "connecting" or "starting" in msg_lower:
+                        status_tracker.update_webrtc_state(camera_name, "connecting")
+                    elif status == "error":
+                        status_tracker.update_webrtc_state(camera_name, "idle")
+                    elif "stopped" in msg_lower:
+                        status_tracker.update_webrtc_state(camera_name, "idle")
+                        status_tracker.update_camera_status(camera_name, detected=True, started=False)
 
-    # Start keyboard input thread for 'q' key to stop gracefully (no-op when run by main.py in Docker)
-    keyboard_thread = threading.Thread(
-        target=keyboard_input_thread,
-        args=(stop_event,),
-        daemon=True,
-    )
-    keyboard_thread.start()
+            for info in camera_infos:
+                cam_name = info["name"]
+                status_tracker.update_camera_status(cam_name, detected=True, started=False)
+                status_tracker.update_webrtc_state(cam_name, "connecting")
 
-    # Start status logging thread
-    status_thread = threading.Thread(
-        target=run_status_logging_thread,
-        args=(status_tracker, stop_event, CONTROL_RATE_HZ, camera_fps),
-        kwargs={
-            "follower": follower,
-            "robot": robot,
-            "mode": "remoteoperate",
-        },
-        daemon=True,
-    )
-    status_thread.start()
+            camera_manager = CameraStreamManager(
+                client=client,
+                twins=enriched_twins,
+                stop_event=stop_event,
+                time_reference=time_reference,
+                command_callback=command_callback,
+            )
+            camera_manager.start()
+        else:
+            status_tracker.camera_states.clear()
 
-    # Start joint position heartbeat thread - publish follower position every second to avoid mismatches
-    heartbeat_thread = threading.Thread(
-        target=joint_position_heartbeat_thread,
-        args=(
-            follower,
-            mqtt_client,
-            twin_uuid,
-            joint_name_to_norm_mode,
-            follower_calibration,
-            motor_id_to_schema_joint,
-            stop_event,
-        ),
-        kwargs={"interval": 1.0},
-        daemon=True,
-    )
-    heartbeat_thread.start()
-
-    # Start camera streaming via SDK CameraStreamManager (one stream per twin, each with own thread)
-    camera_manager: Optional[CameraStreamManager] = None
-    if camera_twins and client is not None:
-        # Enrich overrides with camera_id from follower and fps where not set
-        follower_cameras = (
-            follower.config.cameras if follower is not None and follower.config.cameras else []
+        # Create callback for joint state updates
+        joint_state_callback = create_joint_state_callback(
+            current_state=current_state,
+            action_queue=action_queue,
+            joint_index_to_name=joint_index_to_name,
+            joint_name_to_norm_mode=joint_name_to_norm_mode,
+            follower=follower,
+            follower_calibration=follower_calibration,
+            status_tracker=status_tracker,
+            schema_joint_to_motor_id=schema_joint_to_motor_id,
         )
-        enriched_twins: List[Any] = []
-        for idx, item in enumerate(camera_twins):
-            if isinstance(item, tuple):
-                twin, overrides = item
-                overrides = dict(overrides)
-            else:
-                twin = item
-                overrides = {}
-            if "camera_id" not in overrides:
-                overrides["camera_id"] = follower_cameras[idx] if idx < len(follower_cameras) else 0
-            overrides.setdefault("fps", camera_fps)
-            enriched_twins.append((twin, overrides))
 
-        # Build camera infos for per-camera status display
-        camera_infos = []
-        for item in enriched_twins:
-            if isinstance(item, tuple):
-                twin, overrides = item
-            else:
-                twin, overrides = item, {}
-            cam_name = overrides.get("camera_name")
-            if not cam_name:
-                sensors = getattr(twin, "capabilities", {}).get("sensors", [])
-                cam_name = (
-                    sensors[0].get("id", "default")
-                    if sensors and isinstance(sensors[0], dict)
-                    else "default"
-                )
-            camera_infos.append({"uuid": str(twin.uuid), "name": cam_name})
-        status_tracker.set_camera_infos(camera_infos)
+        # Subscribe to joint states
+        mqtt_client.subscribe_joint_states(twin_uuid, joint_state_callback)
 
-        def command_callback(status: str, msg: str, camera_name: str = "default"):
-            if status_tracker:
-                msg_lower = msg.lower()
-                if "started" in msg_lower or (
-                    status == "ok" and ("streaming" in msg_lower or "running" in msg_lower)
-                ):
-                    status_tracker.update_webrtc_state(camera_name, "streaming")
-                    status_tracker.update_camera_status(camera_name, detected=True, started=True)
-                elif status == "connecting" or "starting" in msg_lower:
-                    status_tracker.update_webrtc_state(camera_name, "connecting")
-                elif status == "error":
-                    status_tracker.update_webrtc_state(camera_name, "idle")
-                elif "stopped" in msg_lower:
-                    status_tracker.update_webrtc_state(camera_name, "idle")
-                    status_tracker.update_camera_status(camera_name, detected=True, started=False)
-
-        for info in camera_infos:
-            cam_name = info["name"]
-            status_tracker.update_camera_status(cam_name, detected=True, started=False)
-            status_tracker.update_webrtc_state(cam_name, "connecting")
-
-        camera_manager = CameraStreamManager(
-            client=client,
-            twins=enriched_twins,
-            stop_event=stop_event,
-            time_reference=time_reference,
-            command_callback=command_callback,
+        # Start motor writer worker thread
+        writer_thread = threading.Thread(
+            target=motor_writer_worker,
+            args=(action_queue, follower, stop_event, status_tracker),
+            daemon=True,
         )
-        camera_manager.start()
-    else:
-        status_tracker.camera_states.clear()
+        writer_thread.start()
 
-    # Create callback for joint state updates
-    joint_state_callback = create_joint_state_callback(
-        current_state=current_state,
-        action_queue=action_queue,
-        joint_index_to_name=joint_index_to_name,
-        joint_name_to_norm_mode=joint_name_to_norm_mode,
-        follower=follower,
-        follower_calibration=follower_calibration,
-        status_tracker=status_tracker,
-        schema_joint_to_motor_id=schema_joint_to_motor_id,
-    )
-
-    # Subscribe to joint states
-    mqtt_client.subscribe_joint_states(twin_uuid, joint_state_callback)
-
-    # Start motor writer worker thread
-    writer_thread = threading.Thread(
-        target=motor_writer_worker,
-        args=(action_queue, follower, stop_event, status_tracker),
-        daemon=True,
-    )
-    writer_thread.start()
-
-    try:
         # Main loop: just wait for stop event
         while not stop_event.is_set():
             time.sleep(0.1)
+
     except KeyboardInterrupt:
-        stop_event.set()
+        pass  # Allow normal cleanup in finally block
+
     finally:
         # Re-enable logging for cleanup diagnostics
         logging.disable(logging.NOTSET)
+        cleanup_logger = logging.getLogger(__name__)
 
         # Signal all threads to stop
-        stop_event.set()
+        if stop_event is not None:
+            stop_event.set()
 
         # Wait for action queue to drain so pending joint updates are delivered
-        try:
-            action_queue.join(timeout=2.0)
-        except Exception:
-            pass
+        if action_queue is not None:
+            try:
+                action_queue.join()
+            except Exception:
+                pass
 
         # Wait for writer thread to finish
-        writer_thread.join(timeout=1.0)
+        if writer_thread is not None:
+            writer_thread.join(timeout=2.0)
 
         # Wait for heartbeat thread
-        heartbeat_thread.join(timeout=1.0)
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
 
         # Stop camera streaming
         if camera_manager is not None:
@@ -410,31 +420,28 @@ def remoteoperate(
         if status_thread is not None:
             status_thread.join(timeout=1.0)
 
-        # Publish telemetry_end last, after queues drained
-        if robot is not None and mqtt_client is not None:
-            logger = logging.getLogger(__name__)
-            twin_uuid_str = str(robot.uuid)
-            logger.info(
-                "Publishing telemetry_end for twin %s (mqtt connected: %s)",
-                twin_uuid_str,
-                mqtt_client.connected if mqtt_client else "N/A",
-            )
-            try:
-                if hasattr(mqtt_client, "publish_telemetry_end"):
-                    mqtt_client.publish_telemetry_end(twin_uuid_str)
-                else:
-                    # Fallback for older SDK versions without publish_telemetry_end
-                    topic = f"{mqtt_client.topic_prefix}cyberwave/twin/{twin_uuid_str}/telemetry"
-                    message = {"type": "telemetry_end", "timestamp": time.time()}
-                    mqtt_client.publish(topic, message)
-                logger.info("telemetry_end published successfully")
-            except Exception:
-                logger.exception("Failed to publish telemetry_end")
-                if status_tracker:
-                    status_tracker.increment_errors_mqtt()
-        else:
-            logger = logging.getLogger(__name__)
-            logger.info("No robot or MQTT client; skipping telemetry_end")
+        # ALWAYS publish telemetry_end, regardless of whether telemetry_start succeeded
+        # This ensures the backend knows the session ended
+        twin_uuid_str = str(robot.uuid)
+        cleanup_logger.info(
+            "Publishing telemetry_end for twin %s (mqtt connected: %s, telemetry_started: %s)",
+            twin_uuid_str,
+            mqtt_client.connected if mqtt_client else "N/A",
+            telemetry_started,
+        )
+        try:
+            if hasattr(mqtt_client, "publish_telemetry_end"):
+                mqtt_client.publish_telemetry_end(twin_uuid_str)
+            else:
+                # Fallback for older SDK versions without publish_telemetry_end
+                topic = f"{mqtt_client.topic_prefix}cyberwave/twin/{twin_uuid_str}/telemetry"
+                message = {"type": "telemetry_end", "timestamp": time.time()}
+                mqtt_client.publish(topic, message)
+            cleanup_logger.info("telemetry_end published successfully")
+        except Exception:
+            cleanup_logger.exception("Failed to publish telemetry_end")
+            if status_tracker:
+                status_tracker.increment_errors_mqtt()
 
 
 def main():

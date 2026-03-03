@@ -384,6 +384,9 @@ def remoteoperate(
     except KeyboardInterrupt:
         stop_event.set()
     finally:
+        # Re-enable logging for cleanup diagnostics
+        logging.disable(logging.NOTSET)
+
         # Signal all threads to stop
         stop_event.set()
 
@@ -409,11 +412,22 @@ def remoteoperate(
 
         # Publish telemetry_end last, after queues drained; wait for MQTT delivery
         if robot is not None and mqtt_client is not None:
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "Publishing telemetry_end for twin %s (mqtt connected: %s)",
+                robot.uuid,
+                mqtt_client.connected if mqtt_client else "N/A",
+            )
             try:
                 mqtt_client.publish_telemetry_end(str(robot.uuid))
+                logger.info("telemetry_end published successfully")
             except Exception:
+                logger.exception("Failed to publish telemetry_end")
                 if status_tracker:
                     status_tracker.increment_errors_mqtt()
+        else:
+            logger = logging.getLogger(__name__)
+            logger.info("No robot or MQTT client; skipping telemetry_end")
 
 
 def main():

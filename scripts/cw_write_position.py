@@ -129,16 +129,18 @@ def write_position(
         logger.error(f"Invalid device type: {device_type}. Must be 'leader' or 'follower'")
         sys.exit(1)
 
-    # Verify calibration is loaded (required for normalization)
-    if not device.is_calibrated:
+    # Verify calibration file exists before connecting. Leaders only load calibration
+    # during connect(), so checking device.calibration directly here is not reliable.
+    calibration_path = device.calibration_fpath
+    if not calibration_path.exists():
         logger.warning(
             f"Device '{device_id}' is not calibrated. "
-            f"Calibration file expected at: {config.calibration_dir / f'{device_id}.json'}. "
+            f"Calibration file expected at: {calibration_path}. "
             f"Normalization may not work correctly. "
             f"Run calibration first: so101-calibrate --type {device_type} --port {port} --id {device_id}"
         )
     else:
-        logger.info(f"Calibration loaded for device '{device_id}'")
+        logger.info(f"Calibration file found for device '{device_id}': {calibration_path}")
 
     try:
         # Connect to device

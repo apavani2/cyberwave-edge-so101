@@ -688,7 +688,10 @@ def main():
     # Initialize leader (required)
     from utils.config import LeaderConfig
 
-    leader_config = LeaderConfig(port=effective_leader_port)
+    leader_config = LeaderConfig(
+        port=effective_leader_port,
+        id=args.leader_id,
+    )
     leader = SO101Leader(config=leader_config)
     leader.connect()
 
@@ -703,6 +706,7 @@ def main():
 
     follower_config = FollowerConfig(
         port=effective_follower_port,
+        id=args.follower_id,
         max_relative_target=max_relative_target,
         cameras=follower_cameras,
     )

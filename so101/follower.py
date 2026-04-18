@@ -1,6 +1,7 @@
 """SO101 Follower class for teleoperation."""
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -80,6 +81,28 @@ class SO101Follower(SO101Robot):
             logger.info("No calibration file found - follower will work without calibration")
 
         self._current_positions: Dict[str, float] = {}
+        self._disabled_motors = self._load_disabled_motors()
+        if self._disabled_motors:
+            logger.warning(
+                "Follower motors disabled via SO101_FOLLOWER_DISABLED_MOTORS: %s",
+                sorted(self._disabled_motors),
+            )
+
+    def _load_disabled_motors(self) -> set[str]:
+        """Load follower motors that should stay unpowered and uncommanded."""
+        raw_value = os.getenv("SO101_FOLLOWER_DISABLED_MOTORS", "").strip()
+        if not raw_value:
+            return set()
+
+        disabled = {part.strip() for part in raw_value.split(",") if part.strip()}
+        unknown = disabled - set(self.motors.keys())
+        if unknown:
+            logger.warning("Ignoring unknown disabled follower motors: %s", sorted(unknown))
+        return disabled & set(self.motors.keys())
+
+    def _active_motor_names(self) -> List[str]:
+        """Return follower motors that are still active."""
+        return [name for name in self.motors if name not in self._disabled_motors]
 
     def __str__(self) -> str:
         """String representation of the follower."""
@@ -125,8 +148,10 @@ class SO101Follower(SO101Robot):
             logger.warning("Follower is already connected")
             return
 
-        # Connect to bus
-        self.bus.connect()
+        # Skip the Feetech preflight on follower arms. Some units transiently report
+        # overload during the model-number handshake even though they can recover once
+        # we synchronize Goal_Position to the current pose and then enable torque.
+        self.bus.connect(preflight_check=False)
         self._connected = True
 
         # Configure motors (set operating mode, PID coefficients)
@@ -153,10 +178,22 @@ class SO101Follower(SO101Robot):
             logger.info("Restoring calibration to follower motors (homing offset, position limits)")
             self.bus.write_calibration(self.calibration)
 
+        # Avoid stale target state when torque is re-enabled by matching each goal to the current pose.
+        motor_ids = [motor.id for motor in self.motors.values()]
+        current_raw_positions = self.bus.sync_read_positions(motor_ids, use_sequential=True)
+        if current_raw_positions:
+            self.bus.sync_write_register(
+                "Goal_Position",
+                {motor_id: int(position) for motor_id, position in current_raw_positions.items()},
+            )
+
 
         # Enable torque for all motors (follower needs torque to move)
         self.bus.enable_torque()
         self._torque_enabled = True
+        if self._disabled_motors:
+            self.disable_torque(sorted(self._disabled_motors))
+            self._torque_enabled = True
 
         # Read initial positions
         self._current_positions = self.get_observation()
@@ -229,6 +266,15 @@ class SO101Follower(SO101Robot):
             if not key.endswith(".pos") and key in self.motors:
                 goal_pos[key] = val
 
+        if self._disabled_motors:
+            goal_pos = {
+                motor_name: value
+                for motor_name, value in goal_pos.items()
+                if motor_name not in self._disabled_motors
+            }
+            if not goal_pos:
+                return {}
+
         # Cap goal position when too far away from present position
         # /!\ Slower fps expected due to reading from the follower.
         if self.config.max_relative_target is not None:
@@ -294,6 +340,20 @@ class SO101Follower(SO101Robot):
     def torque_enabled(self) -> bool:
         """Check if torque is enabled."""
         return self._torque_enabled
+
+    def enable_torque(self, motor_names: Optional[List[str]] = None) -> None:
+        """Enable torque while respecting any follower motors intentionally left disabled."""
+        if motor_names is None:
+            motor_names = self._active_motor_names()
+        else:
+            motor_names = [name for name in motor_names if name not in self._disabled_motors]
+
+        if not motor_names:
+            logger.info("No follower motors eligible for torque enable.")
+            self._torque_enabled = True
+            return
+
+        super().enable_torque(motor_names)
 
     @property
     def calibration_fpath(self) -> Path:

@@ -47,6 +47,18 @@ def get_teleoperate_parser() -> argparse.ArgumentParser:
         help="Follower serial port (override from setup.json)",
     )
     parser.add_argument(
+        "--leader-id",
+        type=str,
+        default=os.getenv("CYBERWAVE_METADATA_LEADER_ID", "leader1"),
+        help="Leader calibration file ID (default: leader1)",
+    )
+    parser.add_argument(
+        "--follower-id",
+        type=str,
+        default=os.getenv("CYBERWAVE_METADATA_FOLLOWER_ID", "follower1"),
+        help="Follower calibration file ID (default: follower1)",
+    )
+    parser.add_argument(
         "--list-realsense",
         action="store_true",
         help="List available RealSense devices and exit",

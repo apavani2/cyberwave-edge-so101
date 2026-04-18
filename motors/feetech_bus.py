@@ -99,6 +99,7 @@ class FeetechMotorsBus(MotorsBus):
         self.motors = motors or {}
         self.calibration = calibration if calibration else {}
         self._io_lock = threading.RLock()
+        self._prefer_sequential_reads: set[str] = set()
         self._calibration_starting_positions: Dict[
             str, float
         ] = {}  # Track starting positions for calibration quality check
@@ -635,7 +636,7 @@ class FeetechMotorsBus(MotorsBus):
         if not register_spec.readable:
             raise ValueError(f"Register {register_name} is not readable")
 
-        if use_sequential:
+        if use_sequential or register_spec.name in self._prefer_sequential_reads:
             return self._sync_read_register_sequential(
                 register_spec.name, motor_ids, num_retry=num_retry, decode=decode
             )
@@ -665,7 +666,15 @@ class FeetechMotorsBus(MotorsBus):
                     num_retry + 1,
                     comm,
                 )
-                return {}
+                self._prefer_sequential_reads.add(register_spec.name)
+                logger.info(
+                    "Falling back to sequential reads for %s on %s",
+                    register_name,
+                    self.port,
+                )
+                return self._sync_read_register_sequential(
+                    register_spec.name, motor_ids, num_retry=num_retry, decode=decode
+                )
 
             values: Dict[int, int] = {}
             for motor_id in motor_ids:
@@ -1029,24 +1038,54 @@ class FeetechMotorsBus(MotorsBus):
         if not register_spec.writable:
             raise ValueError(f"Register {register_name} is not writable")
 
-        encoded_value = encode_register_value(register_spec, value)
-        data = _split_into_byte_chunks(encoded_value, register_spec.length)
-
-        with self._io_lock:
+        def write_encoded_bytes(spec, encoded: int) -> tuple[int | None, int | None]:
+            data = _split_into_byte_chunks(encoded, spec.length)
             result = None
             error = None
             for n_try in range(1 + num_retry):
                 result, error = self._packet_handler.writeTxRx(
                     self._port_handler,
                     motor_id,
-                    register_spec.address,
-                    register_spec.length,
+                    spec.address,
+                    spec.length,
                     data,
                 )
                 if result == self._comm_success:
-                    return
+                    return result, error
                 if n_try < num_retry:
                     continue
+            return result, error
+
+        encoded_value = encode_register_value(register_spec, value)
+
+        with self._io_lock:
+            result = None
+            error = None
+            relock_result = None
+            relock_error = None
+            was_locked = False
+
+            if register_spec.storage == "EEPROM":
+                try:
+                    was_locked = bool(self.read_register_by_id("Lock", motor_id))
+                except Exception as exc:
+                    logger.debug("Failed to read Lock state from motor %s: %s", motor_id, exc)
+                if was_locked:
+                    lock_spec = get_register_spec("Lock")
+                    _, _ = write_encoded_bytes(
+                        lock_spec, encode_register_value(lock_spec, False)
+                    )
+
+            try:
+                result, error = write_encoded_bytes(register_spec, encoded_value)
+                if result == self._comm_success:
+                    return
+            finally:
+                if register_spec.storage == "EEPROM" and was_locked:
+                    lock_spec = get_register_spec("Lock")
+                    relock_result, relock_error = write_encoded_bytes(
+                        lock_spec, encode_register_value(lock_spec, True)
+                    )
 
         logger.warning(
             "Failed to write %s=%s to motor %s: result=%s error=%s",
@@ -1056,6 +1095,13 @@ class FeetechMotorsBus(MotorsBus):
             result,
             error,
         )
+        if register_spec.storage == "EEPROM" and was_locked and relock_result != self._comm_success:
+            logger.warning(
+                "Failed to restore Lock=1 on motor %s after EEPROM write: result=%s error=%s",
+                motor_id,
+                relock_result,
+                relock_error,
+            )
 
     def reset_homing_offsets(self) -> None:
         """
